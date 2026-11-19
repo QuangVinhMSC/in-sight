@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+*.egg-info/
+build/
+dist/
+
+# Generated locally from your In-Sight Vision Suite help (tools/build_catalog.py); not redistributed
+insight_studio/data/functions.json

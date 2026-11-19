@@ -1,0 +1,7 @@
+name: insight-studio
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pyside6>=6.7
+  - pytest
