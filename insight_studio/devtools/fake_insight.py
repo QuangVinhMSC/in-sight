@@ -47,7 +47,9 @@ class FakeInSight(QObject):
         self.listeners: set[str] = set()
         self.expressions: dict[str, str] = {}
         self.values: dict[str, Any] = {}  # values set via setCellValue
+        self.button_presses: list[str] = []  # Button cells pressed via setCellValue
         self.names: dict[str, str] = {}
+        self.conditions: dict[str, str] = {}  # cell states ("0" disabled, a reference = conditional)
         self.files: dict[str, bytes] = {}
         self.state = {"online": False, "softOnline": False, "nativeOnline": True,
                       "discreteOnline": True, "ffpOnline": True, "liveMode": False}
@@ -68,6 +70,7 @@ class FakeInSight(QObject):
         self.expressions = {"A0": "AcquireImage()"}
         self.values = {}
         self.names = {"A0": "Image"}
+        self.conditions = {}
 
     # ------------------------------------------------------------------ transport
     def _on_tcp_connection(self) -> None:
@@ -273,16 +276,22 @@ class FakeInSight(QObject):
             return self.expressions.get(loc, "")
         if member == "setCellExpression":
             loc, expr = self._resolve(args[0]), str(args[1])
+            # like the device: a rewrite keeps the name, cell state and value; clearing drops them
             if expr.strip() == "":
                 self.expressions.pop(loc, None)
                 self.names.pop(loc, None)
+                self.conditions.pop(loc, None)
+                self.values.pop(loc, None)
             else:
                 self.expressions[loc] = expr
-            self.values.pop(loc, None)
             self._new_result()
             return None
         if member == "setCellValue":
             loc = self._resolve(args[0])
+            if cells.function_name(self.expressions.get(loc, "")) == "Button":
+                self.button_presses.append(loc)
+                self._new_result()
+                return None
             self.values[loc] = args[1]
             self._new_result()
             return None
@@ -292,7 +301,24 @@ class FakeInSight(QObject):
             loc, name = self._resolve(args[0]), str(args[1])
             if loc not in self.expressions:
                 raise PermissionError("The cell must contain a value")
+            if not name:
+                self.names.pop(loc, None)
+                return None
+            base, n = name, 0
+            while any(v == name and k != loc for k, v in self.names.items()):
+                n += 1
+                name = f"{base}_{n}"
             self.names[loc] = name
+            return None
+        if member == "getCellCondition":
+            return self.conditions.get(self._resolve(args[0]), "")
+        if member == "setCellCondition":
+            loc, cond = self._resolve(args[0]), str(args[1]).strip()
+            if loc in self.expressions and cond not in ("", "1"):
+                self.conditions[loc] = cond
+            else:
+                self.conditions.pop(loc, None)
+            self._new_result()
             return None
         if member == "queryCellResults":
             rng = args[0][0] if args and isinstance(args[0], list) else cells.FULL_RANGE
@@ -341,7 +367,8 @@ class FakeInSight(QObject):
     # ------------------------------------------------------------------ jobs
     def _job_bytes(self) -> bytes:
         return json.dumps({"format": FAKE_JOB_MAGIC, "cells": self.expressions,
-                           "names": self.names, "values": self.values}).encode()
+                           "names": self.names, "values": self.values,
+                           "conditions": self.conditions}).encode()
 
     def _load_job_bytes(self, data: bytes, name: str) -> None:
         doc = json.loads(data.decode("utf-8"))
@@ -351,6 +378,7 @@ class FakeInSight(QObject):
         self.expressions = dict(doc.get("cells") or {})
         self.names = dict(doc.get("names") or {})
         self.values = dict(doc.get("values") or {})
+        self.conditions = dict(doc.get("conditions") or {})
         self.job_name = name
         self._emit(f"{ROOT}/jobLoadingChanged", False)
         self._emit(f"{ROOT}/jobChanged")
@@ -402,7 +430,12 @@ class FakeInSight(QObject):
         values: dict[str, Any] = {}
         out = []
         for loc in sorted(self.expressions, key=lambda a: (cells.parse_address(a) or (0, 0))):
-            c = self._eval(loc, self.expressions[loc], values)
+            cond = self.conditions.get(loc, "")
+            ref = cells.parse_address(cond) if cond and cond != "0" else None
+            if cond == "0" or (ref and not values.get(cells.address(*ref))):
+                c = {"$type": "HmiFloatResult", "data": values.get(loc, 0.0), "disabled": True}
+            else:
+                c = self._eval(loc, self.expressions[loc], values)
             c["location"] = loc
             c["name"] = self.names.get(loc, loc)
             out.append(c)
@@ -436,16 +469,18 @@ class FakeInSight(QObject):
             v = int(stored if stored is not None else (args[1] if len(args) > 1 else 0))
             values[loc] = v
             return {"$type": "HmiCheckBoxResult", "data": v, "caption": caption, "editable": True}
-        if fn in ("EditRegion", "EditCircle"):
-            if isinstance(stored, dict):
-                data = dict(stored)
-            elif fn == "EditRegion":
-                data = {"$type": "Region", "x": 100.0, "y": 80.0, "w": 240.0, "h": 160.0,
-                        "angle": 0.0, "curve": 0.0}
-            else:
-                data = {"$type": "Circle", "x": 320.0, "y": 240.0, "radius": 80.0}
+        if fn == "Button":
+            return {"$type": "HmiButtonResult", "data": 0, "caption": args[0].strip('"') if args else "",
+                    "editable": True}
+        if fn == "ListBox":
+            options = [a.strip('"') for a in args]
+            v = int(stored) if stored is not None else 0
+            values[loc] = v
+            return {"$type": "HmiListBoxResult", "data": v, "options": options, "editable": True}
+        if fn in _EDIT_GRAPHICS:
+            data = dict(stored) if isinstance(stored, dict) else json.loads(json.dumps(_EDIT_GRAPHICS[fn]))
             data.setdefault("color", -16711936)
-            return {"$type": "HmiButtonResult", "data": data, "caption": fn, "editable": True}
+            return {"$type": "HmiButtonResult", "data": data, "caption": fn, "name": fn, "editable": True}
         # arithmetic over numbers, cell references and cell names
         def ref(m: re.Match) -> str:
             a = m.group(0).replace("$", "")
@@ -484,6 +519,21 @@ class FakeInSight(QObject):
         buf.open(QIODevice.OpenModeFlag.WriteOnly)
         img.save(buf, "PNG")
         return bytes(buf.data().data())
+
+
+_REGION = {"$type": "Region", "x": 100.0, "y": 80.0, "w": 240.0, "h": 160.0, "angle": 0.0, "curve": 0.0}
+# Default graphics of the Edit* controls (HMI API appendix A: an EditMaskedRegion reports a
+# CompositeRegion whose first subregion is the region and the others the masks).
+_EDIT_GRAPHICS = {
+    "EditRegion": _REGION,
+    "EditCircle": {"$type": "Circle", "x": 320.0, "y": 240.0, "radius": 80.0},
+    "EditAnnulus": {"$type": "Annulus", "x": 320.0, "y": 240.0, "innerRadius": 40.0, "outerRadius": 80.0},
+    "EditPolygon": {"$type": "Polygon", "points": [300.0, 150.0, 400.0, 300.0, 200.0, 300.0], "length": 3},
+    "EditCompositeRegion": {"$type": "CompositeRegion", "subregions": [
+        {"$type": "SubRegion", "add": True, "shape": _REGION}]},
+    "EditMaskedRegion": {"$type": "CompositeRegion", "subregions": [
+        {"$type": "SubRegion", "add": True, "shape": _REGION}]},
+}
 
 
 def _split_args(text: str) -> list[str]:

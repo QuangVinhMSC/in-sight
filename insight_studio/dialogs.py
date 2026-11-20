@@ -1,27 +1,19 @@
-"""Dialogs: connect, insert function, set cell value, device files."""
+"""Dialogs: connect, device files."""
 
 from __future__ import annotations
 
-from typing import Any, Optional
-
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtWidgets import (
-    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
-    QDoubleSpinBox,
     QFormLayout,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
-    QSpinBox,
     QVBoxLayout,
 )
-
-from . import cells
-from .catalog import Catalog, FunctionInfo
 
 
 class ConnectDialog(QDialog):
@@ -67,122 +59,14 @@ class ConnectDialog(QDialog):
         settings.setValue("connect/user", self.user.text().strip())
 
 
-class InsertFunctionDialog(QDialog):
-    def __init__(self, catalog: Catalog, target: str, parent=None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle(f"Insert function into {target}")
-        self.resize(520, 480)
-        self.catalog = catalog
-        self.search = QLineEdit()
-        self.search.setPlaceholderText("Search functions…")
-        self.search.textChanged.connect(self._refresh)
-        self.list = QListWidget()
-        self.list.currentItemChanged.connect(self._show)
-        self.list.itemDoubleClicked.connect(lambda *_: self.accept())
-        self.signature = QLabel()
-        self.signature.setWordWrap(True)
-        self.signature.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.signature.setMinimumHeight(48)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Insert")
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout = QVBoxLayout(self)
-        layout.addWidget(self.search)
-        layout.addWidget(self.list, 1)
-        layout.addWidget(self.signature)
-        layout.addWidget(buttons)
-        self._refresh("")
-        self.search.setFocus()
-
-    def _refresh(self, text: str) -> None:
-        self.list.clear()
-        for f in self.catalog.search(text):
-            item = QListWidgetItem(f.name)
-            item.setData(Qt.ItemDataRole.UserRole, f)
-            item.setToolTip(f.signature)
-            self.list.addItem(item)
-        if self.list.count():
-            self.list.setCurrentRow(0)
-
-    def _show(self, item: Optional[QListWidgetItem]) -> None:
-        f: Optional[FunctionInfo] = item.data(Qt.ItemDataRole.UserRole) if item else None
-        if not f:
-            self.signature.setText("")
-            return
-        text = f"<b>{f.signature}</b>"
-        if f.template:
-            text += f"<br>Inserts: <code>{f.template}</code>"
-        else:
-            text += "<br>Inserts the function name; fill in the arguments in the formula bar."
-        self.signature.setText(text)
-
-    def selected(self) -> Optional[FunctionInfo]:
-        item = self.list.currentItem()
-        return item.data(Qt.ItemDataRole.UserRole) if item else None
-
-
-class SetValueDialog(QDialog):
-    """Edits the value of an HMI control cell (EditInt, EditFloat, EditString, CheckBox, ListBox)."""
-
-    def __init__(self, location: str, result: dict, parent=None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle(f"Set value of {location}")
-        self.kind = cells.result_kind(result)
-        data = result.get("data")
-        form = QFormLayout()
-        if self.kind == "EditIntResult":
-            self.editor = QSpinBox()
-            self.editor.setRange(int(result.get("min", -2147483648)), int(result.get("max", 2147483647)))
-            self.editor.setValue(int(data or 0))
-        elif self.kind == "EditFloatResult":
-            self.editor = QDoubleSpinBox()
-            self.editor.setDecimals(4)
-            self.editor.setRange(float(result.get("min", -1e12)), float(result.get("max", 1e12)))
-            self.editor.setValue(float(data or 0))
-        elif self.kind == "EditStringResult":
-            self.editor = QLineEdit("" if data is None else str(data))
-            if result.get("maxLength"):
-                self.editor.setMaxLength(int(result["maxLength"]))
-            if result.get("maskInput"):
-                self.editor.setEchoMode(QLineEdit.EchoMode.Password)
-        elif self.kind == "CheckBoxResult":
-            self.editor = QCheckBox(result.get("caption") or "")
-            self.editor.setChecked(bool(data))
-        elif self.kind == "ListBoxResult":
-            self.editor = QComboBox()
-            self.editor.addItems([str(o) for o in result.get("options") or []])
-            self.editor.setCurrentIndex(int(data or 0))
-        else:
-            raise ValueError(f"{location} is not an editable control")
-        form.addRow(f"{result.get('name') or location}:", self.editor)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout = QVBoxLayout(self)
-        layout.addLayout(form)
-        layout.addWidget(buttons)
-
-    def value(self) -> Any:
-        if self.kind == "EditIntResult":
-            return self.editor.value()
-        if self.kind == "EditFloatResult":
-            return self.editor.value()
-        if self.kind == "EditStringResult":
-            return self.editor.text()
-        if self.kind == "CheckBoxResult":
-            return 1 if self.editor.isChecked() else 0
-        if self.kind == "ListBoxResult":
-            return self.editor.currentIndex()
-        return None
-
-
 class DeviceFilesDialog(QDialog):
     """Picks a job file on the device (open) or enters a file name (save)."""
 
-    def __init__(self, files: list[dict], save: bool, default_name: str = "", parent=None) -> None:
+    def __init__(self, files: list[dict], save: bool, default_name: str = "", parent=None,
+                 title: str = "", pc_button: str = "") -> None:
         super().__init__(parent)
-        self.setWindowTitle("Save job on device" if save else "Open job on device")
+        self.setWindowTitle(title or ("Save job on device" if save else "Open job on device"))
+        self.use_pc = False  # True when the user chose the PC instead of the device
         self.resize(420, 380)
         self.list = QListWidget()
         for f in files:
@@ -200,13 +84,20 @@ class DeviceFilesDialog(QDialog):
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Save" if save else "Open")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
+        if pc_button:
+            pc = buttons.addButton(pc_button, QDialogButtonBox.ButtonRole.ActionRole)
+            pc.clicked.connect(self._choose_pc)
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Files on the device:"))
+        layout.addWidget(QLabel("Files on the In-Sight vision system:"))
         layout.addWidget(self.list, 1)
         form = QFormLayout()
         form.addRow("File name:", self.name)
         layout.addLayout(form)
         layout.addWidget(buttons)
+
+    def _choose_pc(self) -> None:
+        self.use_pc = True
+        self.accept()
 
     def filename(self) -> str:
         return self.name.text().strip()

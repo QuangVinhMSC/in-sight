@@ -1,7 +1,15 @@
 """Builds insight_studio/data/functions.json from a local In-Sight Vision Suite installation.
 
-Only factual data is extracted: function names, parameter lists and the help page path (so
-the app can open the locally installed help). No help prose is copied.
+Only factual data is extracted: function names, parameter lists, the toolbox category tree, the
+names of the Vision Data Access functions a tool inserts (its getters) and the help page path
+of every function and category (so the app can read the locally installed help: descriptions
+are never copied into the catalog).
+
+The category tree is the help's own table of contents below "In-Sight Toolbox", renamed the way
+the ISVS Insert Function dialog and Functions panel show it (``Edge AI Tools`` -> ``Edge AI``,
+``InspectEdge Functions`` -> ``InspectEdge``). A TOC entry is a function when its page documents
+a function of that name, a category when it holds functions (its own table of functions, such
+as Math, or function pages below it), and is skipped otherwise (how-to pages, examples).
 
 Usage:
     python tools/build_catalog.py ["C:/Program Files/Cognex/In-Sight/In-Sight Vision Suite Editors/In-Sight/In-Sight 26.1.0"]
@@ -14,11 +22,17 @@ import json
 import re
 import sys
 from pathlib import Path
+from typing import Optional
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from insight_studio.catalog import editor_versions  # noqa: E402
+from insight_studio.helpdoc import function_tables, parse_html, parse_inputs  # noqa: E402
 
 DEFAULT_EDITOR = Path(
     "C:/Program Files/Cognex/In-Sight/In-Sight Vision Suite Editors/In-Sight/In-Sight 26.1.0"
 )
 OUT = Path(__file__).resolve().parent.parent / "insight_studio" / "data" / "functions.json"
+TOC = "Data/Tocs/is_usp_sheet"
 
 # Templates that are known to produce a valid cell (sample jobs / Web SDK documentation).
 TEMPLATES = {
@@ -37,8 +51,47 @@ TEMPLATES = {
     "Now": "Now($A$0)",
 }
 
+# Top-level toolbox categories as ISVS names them (help TOC title -> ISVS name).
+TOP_NAMES = {
+    "Edge AI Tools": "Edge AI",
+    "Geometry Functions": "Geometry",
+    "Graphics Functions": "Graphics",
+    "Mathematics Functions": "Mathematics",
+    "Text Functions": "Text",
+    "Coordinate Transforms Functions": "Coordinate Transforms",
+    "Input/Output Functions": "Input/Output",
+    "Clocked Data Storage Functions": "Clocked Data Storage",
+    "Vision Data Access Functions": "Vision Data Access",
+    "White Balance Functions": "White Balance",
+    "Structures Functions": "Structures",
+    "Focus Functions": "Focus",
+}
+# Categories ISVS 26.1 did not list for the IS8902CX (they depend on the vision system model):
+# they are kept in the catalog (completion, property sheets) but not shown in the toolbox tree.
+DEVICE_SPECIFIC = {"Advanced AI", "Focus"}
+
+# Parameters that are greyed out in the property sheet unless another parameter has one of the
+# given values (from the "Note: ... to enable this parameter" sentences of the help; the
+# controlling parameter's choices are given by label and resolved to values below).
+ENABLE_RULES: dict[str, dict[str, tuple[str, list[str]]]] = {
+    "TrainPatMaxRedLine": {
+        "Coarse Granularity": ("Auto Select Coarse", ["OFF"]),
+        "Fine Granularity": ("Auto Select Fine", ["OFF"]),
+    },
+    "Filter": {"Threshold": ("Auto Threshold", ["OFF"])},
+    "ValidateIDData": {"DoD UID Construct": ("Validation Options", ["DoD UID"])},
+    "WriteData": {p: ("Storage", ["FTP Server", "SFTP Server"]) for p in ("Server", "User Name", "Password")},
+    "WriteImage": {"Server": ("Storage", ["FTP Server", "SFTP Server", "TCP Server"]),
+                   "User Name": ("Storage", ["FTP Server", "SFTP Server"]),
+                   "Password": ("Storage", ["FTP Server", "SFTP Server"])},
+    "ImportData": {p: ("Storage", ["FTP/SFTP Server"]) for p in ("Host Name", "User Name", "Password")},
+    "ExportData": {p: ("Storage", ["FTP/SFTP Server"]) for p in ("Host Name", "User Name", "Password")},
+}
+
 _SYNTAX_RE = re.compile(r'<span class="pre">((?:(?!<span class="pre">|</p>).)*?)</span>\s*</p>', re.S)
 _TAG_RE = re.compile(r"<[^>]+>")
+_TITLE_RE = re.compile(r'document\.title = "In-Sight Spreadsheet - ([A-Za-z][A-Za-z0-9_]*) - ')
+_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 def clean(text: str) -> str:
@@ -58,43 +111,279 @@ def parse_params(sig: str) -> tuple[str, list[str]] | None:
     return name, params
 
 
+# ---------------------------------------------------------------------------- help TOC
+def _js_object(text: str):
+    """Parses the JavaScript object literal inside ``define(...)`` of a MadCap TOC file."""
+    body = text[text.index("(") + 1:text.rindex(")")]
+    out: list[str] = []
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch == "'":
+            j, s = i + 1, []
+            while body[j] != "'":
+                if body[j] == "\\":
+                    s.append(body[j + 1])
+                    j += 2
+                    continue
+                s.append(body[j])
+                j += 1
+            out.append(json.dumps("".join(s)))
+            i = j + 1
+            continue
+        m = _IDENT.match(body, i)
+        if m and body[m.end():m.end() + 1] == ":" and (not out or out[-1][-1:] in "{,"):
+            out.append(json.dumps(m.group(0)) + ":")
+            i = m.end() + 1
+            continue
+        out.append(ch)
+        i += 1
+    return json.loads("".join(out))
+
+
+def read_toc(help_dir: Path) -> tuple[dict, dict[int, tuple[str, str]]]:
+    head = _js_object((help_dir / f"{TOC}.js").read_text(encoding="utf-8"))
+    entries: dict[int, tuple[str, str]] = {}
+    for k in range(head["numchunks"]):
+        chunk = _js_object((help_dir / f"{TOC}_Chunk{k}.js").read_text(encoding="utf-8"))
+        for url, v in chunk.items():
+            for idx, title in zip(v["i"], v["t"]):
+                entries[idx] = (title, url.lstrip("/"))
+    return head["tree"], entries
+
+
+def _find(node: dict, entries, pred) -> Optional[dict]:
+    for c in node.get("n", []):
+        if pred(*entries.get(c["i"], ("", ""))):
+            return c
+        found = _find(c, entries, pred)
+        if found:
+            return found
+    return None
+
+
+def category_name(title: str, top: bool) -> str:
+    if top:
+        return TOP_NAMES.get(title, title)
+    for suffix in (" Vision Data Access functions", " Vision Data Access Functions", " Functions"):
+        if title.endswith(suffix):
+            return title[: -len(suffix)]
+    return title
+
+
+# ---------------------------------------------------------------------------- pages
+class Page:
+    def __init__(self, help_dir: Path, rel: str) -> None:
+        self.rel = rel
+        self.text = (help_dir / rel).read_text(encoding="utf-8", errors="replace")
+        self._root = None
+
+    @property
+    def root(self):
+        if self._root is None:
+            self._root = parse_html(self.text)
+        return self._root
+
+    def signatures(self) -> list[tuple[str, list[str]]]:
+        if "following syntax" not in self.text:
+            return []
+        return [p for p in (parse_params(clean(raw)) for raw in _SYNTAX_RE.findall(self.text)) if p]
+
+    def title_function(self) -> Optional[str]:
+        m = _TITLE_RE.search(self.text)
+        return m.group(1) if m else None
+
+    def tables(self) -> list[tuple[str, Optional[list[str]]]]:
+        """Functions listed in "Function | Description" tables: (name, params or None)."""
+        out = []
+        for name, args in function_tables(self.root):
+            params = None
+            if args is not None:
+                parsed = parse_params(f"{name}({args})")
+                params = parsed[1] if parsed else []
+            out.append((name, params))
+        return out
+
+
+def stem_key(rel: str) -> str:
+    return Path(rel).stem.replace("-", "").replace("_", "").lower()
+
+
+class Builder:
+    def __init__(self, help_dir: Path) -> None:
+        self.help_dir = help_dir
+        self.pages: dict[str, Page] = {}
+        self.functions: dict[str, dict] = {}
+
+    def page(self, rel: str) -> Optional[Page]:
+        if rel not in self.pages:
+            path = self.help_dir / rel
+            if not path.is_file():
+                return None
+            self.pages[rel] = Page(self.help_dir, rel)
+        return self.pages[rel]
+
+    def entry(self, name: str, params, rel: str) -> dict:
+        e = self.functions.get(name.lower())
+        if e is None:
+            e = self.functions[name.lower()] = {"name": name, "params": params, "help": rel}
+        elif e.get("params") is None and params is not None:
+            e["params"] = params
+        return e
+
+    def add_function_page(self, name: str, page: Page) -> dict:
+        sigs = dict((n.lower(), p) for n, p in page.signatures())
+        e = self.entry(name, sigs.get(name.lower()), page.rel)
+        if stem_key(page.rel) == name.lower() or e["help"] == page.rel:
+            e["help"] = page.rel
+            if "inputs" not in e:
+                inputs = parse_inputs(page.text, keep_description=False)  # structure only
+                if inputs:
+                    e["inputs"] = inputs
+        getters = [n for n, _ in page.tables()]
+        if getters:
+            e["getters"] = list(dict.fromkeys(getters))
+        return e
+
+    def function_name(self, node: dict, entries) -> Optional[str]:
+        """The function a TOC entry documents, if it is a function page."""
+        title, rel = entries.get(node["i"], ("", ""))
+        page = self.page(rel)
+        title = title.strip()
+        if page is None or not _IDENT.fullmatch(title):
+            return None
+        names = {n.lower(): n for n, _ in page.signatures()}
+        if title.lower() in names:
+            return names[title.lower()]
+        # Tool pages without a syntax line (TrainPatMaxRedLine, OCRMax, EdgeAI…): the page title
+        # names the function. Category pages look the same but have function pages below them
+        # (Vision Tools > Image) or a table of functions (Math, Logic); a tool page's table
+        # only lists the getters it inserts (EdgeAIClassify).
+        tf = page.title_function()
+        if tf and tf.lower() == title.lower() and stem_key(rel) == title.lower() \
+                and all(n.startswith("Get") for n, _ in page.tables()) \
+                and not self.functions_below(node, entries):
+            return tf
+        return None
+
+    def functions_below(self, node: dict, entries) -> bool:
+        return any(self.function_name(c, entries) or self.functions_below(c, entries) for c in node.get("n", []))
+
+    def walk(self, node: dict, entries, path: list[str]) -> list[dict]:
+        """Categories below ``node``; records each function with its category ``path``."""
+        cats: list[dict] = []
+        for c in node.get("n", []):
+            title, rel = entries.get(c["i"], ("", ""))
+            page = self.page(rel)
+            fn = self.function_name(c, entries)
+            if fn and path:
+                e = self.add_function_page(fn, page)
+                if path not in e.setdefault("paths", []):
+                    e["paths"].append(list(path))
+                continue
+            name = category_name(title, top=not path)
+            sub_path = path + [name]
+            listed = page.tables() if page else []
+            for fname, params in listed:
+                e = self.entry(fname, params, rel)
+                if sub_path not in e.setdefault("paths", []):
+                    e["paths"].append(list(sub_path))
+            children = self.walk(c, entries, sub_path)
+            has_functions = bool(listed) or any(
+                sub_path == p[: len(sub_path)] for e in self.functions.values() for p in e.get("paths", []))
+            if has_functions:
+                cat = {"name": name, "help": rel}
+                if children:
+                    cat["children"] = children
+                if not path and name in DEVICE_SPECIFIC:
+                    cat["hidden"] = True
+                cats.append(cat)
+        return cats
+
+    def scan_remaining(self, content: Path) -> None:
+        """Function pages that are not in the toolbox TOC (older or device-specific functions)."""
+        for path in sorted((content / "Topics" / "Spreadsheet").rglob("*.htm")):
+            rel = path.relative_to(self.help_dir).as_posix()
+            page = self.page(rel)
+            for name, params in page.signatures():
+                if name.lower() not in self.functions:
+                    e = self.entry(name, params, rel)
+                    if stem_key(rel) == name.lower():
+                        inputs = parse_inputs(page.text, keep_description=False)
+                        if inputs:
+                            e["inputs"] = inputs
+            tf = page.title_function()
+            if (tf and stem_key(rel) == tf.lower() and tf.lower() not in self.functions
+                    and parse_inputs(page.text, keep_description=False)):
+                self.add_function_page(tf, page)
+
+    def apply_enable_rules(self) -> None:
+        for fname, rules in ENABLE_RULES.items():
+            e = self.functions.get(fname.lower())
+            if not e or not e.get("inputs"):
+                print(f"warning: enable rules for {fname}: no parameter list", file=sys.stderr)
+                continue
+            params = {p["name"].lower(): p for p in _leaves(e["inputs"])}
+            out = {}
+            for target, (control, labels) in rules.items():
+                ctrl = params.get(control.lower())
+                if target.lower() not in params or not ctrl or not ctrl.get("options"):
+                    print(f"warning: enable rule {fname}.{target} <- {control}: parameter not found",
+                          file=sys.stderr)
+                    continue
+                values = [o["value"] for o in ctrl["options"]
+                          if any(lab.lower() == o["label"].lower() for lab in labels)]
+                if len(values) != len(labels):
+                    print(f"warning: enable rule {fname}.{target}: choices {labels} not all in "
+                          f"{[o['label'] for o in ctrl['options']]}", file=sys.stderr)
+                if values:
+                    out[params[target.lower()]["name"]] = {"param": ctrl["name"], "values": values}
+            if out:
+                e["enable"] = out
+
+
+def _leaves(params: list[dict]):
+    for p in params:
+        if p.get("children"):
+            yield from _leaves(p["children"])
+        yield p
+
+
 def main() -> int:
-    editor = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_EDITOR
-    content = editor / "Docs" / "Help_InSight" / "Content"
+    if len(sys.argv) > 1:
+        editor = Path(sys.argv[1])
+    else:
+        installed = editor_versions()  # Windows install, or ISVS under Wine on Linux
+        editor = installed[0] if installed else DEFAULT_EDITOR
+    help_dir = editor / "Docs" / "Help_InSight"
+    content = help_dir / "Content"
     if not content.is_dir():
         print(f"Help not found under {content}", file=sys.stderr)
         return 1
-    entries: dict[str, dict] = {}
-    for page in sorted((content / "Topics" / "Spreadsheet").rglob("*.htm")):
-        text = page.read_text(encoding="utf-8", errors="replace")
-        rel = page.relative_to(content.parent).as_posix()
-        category = page.parent.name if page.parent.name != "Spreadsheet" else "General"
-        found = False
-        if "following syntax" in text:
-            for raw in _SYNTAX_RE.findall(text):
-                parsed = parse_params(clean(raw))
-                if not parsed:
-                    continue
-                name, params = parsed
-                found = True
-                entries.setdefault(name, {
-                    "name": name, "params": params, "category": category, "help": rel,
-                })
-        if not found:
-            m = re.search(r'document\.title = "In-Sight Spreadsheet - ([A-Za-z][A-Za-z0-9_]*) - ', text)
-            if m and category == "VisionTools" and m.group(1) == page.stem.replace("-", ""):
-                name = m.group(1)
-                entries.setdefault(name, {"name": name, "params": None, "category": category,
-                                          "help": rel})
+    tree, entries = read_toc(help_dir)
+    toolbox = _find(tree, entries, lambda title, url: url.endswith("/insighttoolbox.htm"))
+    if toolbox is None:
+        print("The help TOC has no In-Sight Toolbox entry", file=sys.stderr)
+        return 1
+    b = Builder(help_dir)
+    categories = b.walk(toolbox, entries, [])
+    b.scan_remaining(content)
+    b.apply_enable_rules()
     for name, template in TEMPLATES.items():
-        entries.setdefault(name, {"name": name, "params": None, "category": "VisionTools"})
-        entries[name]["template"] = template
+        e = b.functions.get(name.lower()) or b.entry(name, None, "")
+        e["template"] = template
+    functions = sorted(b.functions.values(), key=lambda e: e["name"].lower())
+    for e in functions:
+        if not e.get("help"):
+            e.pop("help", None)
+    doc = {"source": f"In-Sight Vision Suite help ({editor.name})", "toolbox_help": entries[toolbox["i"]][1],
+           "categories": categories, "functions": functions}
     OUT.parent.mkdir(parents=True, exist_ok=True)
-    doc = {"source": f"In-Sight Vision Suite help ({editor.name})",
-           "functions": sorted(entries.values(), key=lambda e: e["name"].lower())}
     OUT.write_text(json.dumps(doc, indent=1), encoding="utf-8")
-    with_params = sum(1 for e in entries.values() if e.get("params"))
-    print(f"Wrote {len(entries)} functions ({with_params} with parameter lists) to {OUT}")
+    in_tree = sum(1 for e in functions if e.get("paths"))
+    with_inputs = sum(1 for e in functions if e.get("inputs"))
+    print(f"Wrote {len(functions)} functions ({in_tree} in the toolbox tree, {with_inputs} with property "
+          f"sheets, {sum(1 for e in functions if e.get('getters'))} with getters) to {OUT}")
     return 0
 
 

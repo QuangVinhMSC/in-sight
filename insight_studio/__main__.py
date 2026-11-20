@@ -20,11 +20,13 @@ def main() -> int:
 
     from PySide6.QtWidgets import QApplication
 
+    from . import theme
     from .main_window import MainWindow
 
     app = QApplication(sys.argv)
     app.setOrganizationName("InsightStudio")
     app.setApplicationName("Insight Studio")
+    theme.apply(app)
     win = MainWindow()
     win.show()
     if ns.connect:

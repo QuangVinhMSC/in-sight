@@ -251,6 +251,50 @@ def display_text(cell: Optional[dict], expression: str = "", decimals: Optional[
     return _strip_controls(str(data))
 
 
+STRUCTURE_GLYPH = "❒"
+
+
+def grid_text(cell: Optional[dict], expression: str = "", decimals: Optional[int] = None) -> str:
+    """Text shown in a grid cell: like :func:`display_text`, but structures keep ISVS's ``❒`` glyph."""
+    text = display_text(cell, expression, decimals)
+    if is_structure(cell) and not (cell.get("error") or result_kind(cell) == "ErrorCellResult"):
+        return STRUCTURE_GLYPH + text
+    return text
+
+
+def is_error(cell: Optional[dict]) -> bool:
+    return bool(cell) and (bool(cell.get("error")) or result_kind(cell) == "ErrorCellResult")
+
+
+# In-cell HMI controls drawn as widgets in the grid (ISVS shows them as live controls).
+CONTROL_KINDS = {
+    "CheckBoxResult": "checkbox",
+    "ListBoxResult": "listbox",
+    "EditIntResult": "editint",
+    "EditFloatResult": "editfloat",
+    "EditStringResult": "editstring",
+    "ButtonResult": "button",
+    "StatusResult": "status",
+    "StatusLightResult": "status",
+    "MultiStatusResult": "multistatus",
+}
+
+
+def control_kind(cell: Optional[dict]) -> Optional[str]:
+    """The kind of in-cell control for a result ("checkbox", "button", "graphic", ...), or None.
+
+    Error cells are drawn as ``#ERR`` instead of a control.
+    """
+    if not cell or is_error(cell):
+        return None
+    kind = result_kind(cell)
+    if editable_graphic(cell) is not None:
+        return "graphic"
+    if kind in _LEGACY_EDIT_GRAPHIC:
+        return "graphic"
+    return CONTROL_KINDS.get(kind)
+
+
 def is_value_editable(cell: Optional[dict]) -> bool:
     """True when the cell is an HMI control whose value can be set with setCellValue."""
     if not cell or cell.get("disabled") or cell.get("error"):

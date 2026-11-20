@@ -1,45 +1,18 @@
 """Smoke test of the main window against the fake device (offscreen)."""
 
-import pytest
-from PySide6.QtCore import QDeadlineTimer, QSettings
+from conftest import pump_until
+from PySide6.QtCore import QPointF
 
 from insight_studio import cells
-from insight_studio.devtools.fake_insight import FakeInSight
-from insight_studio.main_window import MainWindow
-from insight_studio.qtasync import wait
-
-
-def pump_until(qapp, cond, timeout_ms=4000):
-    deadline = QDeadlineTimer(timeout_ms)
-    while not cond():
-        if deadline.hasExpired():
-            raise TimeoutError("condition not met")
-        qapp.processEvents()
-
-
-@pytest.fixture
-def window(qapp, tmp_path):
-    QSettings.setDefaultFormat(QSettings.Format.IniFormat)
-    QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, str(tmp_path))
-    fake = FakeInSight(0)
-    win = MainWindow()
-    win.show()
-    errors = []
-    win._show_error = lambda what, exc: errors.append(f"{what}: {exc}")
-    wait(win.device.connect_to(fake.host, "admin", ""))
-    pump_until(qapp, lambda: not win.image._pixmap.pixmap().isNull())
-    yield win, fake, errors
-    win.close()
-    fake.tcp.close()
 
 
 def test_connect_shows_image_and_sheet(window, qapp):
     win, fake, errors = window
     assert win.model.expressions["A0"] == "AcquireImage()"
     idx = win.model.index(0, 0)
-    assert win.model.data(idx) == "Image"
+    assert win.model.data(idx) == "❒Image"  # structures keep ISVS's glyph
     assert win.image._pixmap.pixmap().width() == 640
-    assert win.names_list.count() == 1
+    assert win.name_box.count() == 1
     assert not errors
 
 
@@ -51,8 +24,7 @@ def test_formula_bar_commit(window, qapp):
     pump_until(qapp, lambda: win.model.expressions.get("B3") == "EditInt(0,10)")
     pump_until(qapp, lambda: "B3" in win.model.results)
     assert fake.expressions["B3"] == "EditInt(0,10)"
-    win.sheet.select_location("B3")
-    assert win.act_value.isEnabled()
+    assert win.delegate.kind(win.model.index(3, 1)) == "editint"  # drawn as an in-cell control
     assert not errors
 
 
@@ -77,8 +49,9 @@ def test_edit_region_graphic(window, qapp):
     win.edit_graphic()
     pump_until(qapp, lambda: win.image.editor is not None)
     ed = win.image.editor
-    ed._move_by(type(ed.handles[0].pos())(10, 20))
-    ed._region_size(type(ed.handles[0].pos())(400, 300))
+    shape = ed.shapes[0]
+    ed.move_shape(shape, QPointF(10, 20))
+    shape._corner(1, 1, QPointF(400, 300))  # bottom-right corner
     win.accept_graphic()
     pump_until(qapp, lambda: isinstance(fake.values.get("C5"), dict))
     v = fake.values["C5"]

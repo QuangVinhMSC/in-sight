@@ -102,6 +102,7 @@ class InSightDevice(QObject):
         self.expressions: dict[str, dict] = {}
         self.cell_names: dict[str, str] = {}
         self.sheet_format: dict = {}
+        self.conditions_supported = True  # get/setCellCondition (firmware 23.1.1+)
         self._keep_alive = QTimer(self)
         self._keep_alive.setInterval(KEEP_ALIVE_MS)
         self._keep_alive.timeout.connect(self._send_keep_alive)
@@ -160,6 +161,7 @@ class InSightDevice(QObject):
             raise DeviceError("No host given")
         self.host = host
         self.username = username
+        self.conditions_supported = True
         sock = CogSocket(self)
         sock.traffic.connect(self.traffic)
         sock.closed.connect(self._on_socket_closed)
@@ -410,6 +412,77 @@ class InSightDevice(QObject):
 
     async def set_cell_condition(self, location: str, condition: str) -> None:
         await self._require().post(self._s("setCellCondition"), [location, condition])
+
+    async def get_cell_conditions(self, locations) -> dict[str, str]:
+        """Cell states of the given cells ("" enabled, "0" disabled, a reference = conditional).
+
+        Returns {} on devices without get/setCellCondition (firmware before 23.1.1).
+        """
+        if not self.conditions_supported:
+            return {}
+        sock = self._require()
+        out: dict[str, str] = {}
+        for loc in locations:
+            try:
+                out[loc] = str(await sock.post(self._s("getCellCondition"), [loc]) or "")
+            except CogSocketError as e:
+                if not out:
+                    log.info("getCellCondition not available: %s", e)
+                    self.conditions_supported = False
+                    return {}
+                raise
+        return out
+
+    async def write_cells(self, targets: dict, current: dict) -> None:
+        """Writes target :class:`~insight_studio.sheet_ops.CellState` s, then refreshes once.
+
+        ``current`` holds the states of the same cells now (names/conditions may be None = unknown).
+        Order matters on the device: names that move are released first (a name in use gets a
+        ``_1`` suffix), expressions next (a name or cell state needs a non-empty cell, clearing a
+        cell drops both), then cell states, names and control values.
+        """
+        from .sheet_ops import EMPTY
+
+        sock = self._require()
+        errors: list[str] = []
+
+        async def call(member: str, loc: str, *args) -> bool:
+            try:
+                await sock.post(self._s(member), [loc, *args])
+                return True
+            except CogSocketError as e:
+                errors.append(f"{loc}: {e}")
+                return False
+
+        released = set()
+        for loc, t in targets.items():
+            cur = current.get(loc, EMPTY)
+            if t.expr and cur.expr and cur.name and t.name is not None and t.name != cur.name:
+                if await call("setCellName", loc, ""):
+                    released.add(loc)
+        for loc, t in targets.items():
+            if t.expr != current.get(loc, EMPTY).expr:
+                await call("setCellExpression", loc, t.expr)
+        for loc, t in targets.items():
+            cur = current.get(loc, EMPTY)
+            if not t.expr:
+                continue
+            fresh = not cur.expr
+            if t.condition is not None and self.conditions_supported:
+                now = "" if fresh else cur.condition
+                if t.condition != now:
+                    await call("setCellCondition", loc, t.condition)
+            if t.name:
+                now = "" if fresh or loc in released else (cur.name or "")
+                if t.name != now:
+                    await call("setCellName", loc, t.name)
+            if t.value is not None:
+                await call("setCellValue", loc, t.value)
+        await self.refresh_expressions()
+        await self.refresh_cell_names()
+        await self.latest_result()
+        if errors:
+            raise DeviceError("Some cells could not be written:\n" + "\n".join(errors))
 
     # ------------------------------------------------------------------ graphic editing
     async def begin_edit(self, location: str) -> Any:
