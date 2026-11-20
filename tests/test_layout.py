@@ -168,7 +168,9 @@ def test_graphic_editing_hides_overlaid_grid(window, qapp):
     win.act_edit_graphic.trigger()
     pump_until(qapp, lambda: win.image.editor is not None)
     assert not win.area.grid_visible()
-    assert "Interactive Graphics Mode" in win.area.pixel_strip.text()
+    # ISVS's status line under the image; the hint goes to the status bar
+    assert win.area.pixel_strip.text().startswith("Location=") and "Rotation=" in win.area.pixel_strip.text()
+    assert "Interactive Graphics Mode" in win.statusBar().currentMessage()
     assert win.act_accept.shortcut().toString() == "Return"
     win.act_cancel.trigger()
     pump_until(qapp, lambda: win.image.editor is None)
@@ -203,13 +205,15 @@ def test_insert_function_on_function_cell_opens_property_sheet(window, qapp, mon
     win.act_insert.trigger()
     assert win.property_sheet is not None and win.property_sheet.isVisible()
     win.property_sheet.reject()
-    # A0 holds AcquireImage(), which has no property sheet: the Insert Function dialog opens
-    if win.catalog.get("AcquireImage"):  # known to have no inputs (needs the generated catalog)
-        opened = []
-        monkeypatch.setattr(InsertFunctionDialog, "exec", lambda dlg: opened.append(dlg) or 0)
-        win.sheet.select_location("A0")
-        win.act_insert.trigger()
-        assert opened
+    # A0 holds AcquireImage(): ISVS brings up the Acquisition tab instead of a dialog (survey §3)
+    opened = []
+    monkeypatch.setattr(InsertFunctionDialog, "exec", lambda dlg: opened.append(dlg) or 0)
+    win.func_dock.raise_()
+    win.sheet.select_location("A0")
+    win.act_insert.trigger()
+    assert not opened and win.acq_dock.isVisible()
+    qapp.processEvents()
+    assert win.func_dock.visibleRegion().isEmpty() and not win.acq_dock.visibleRegion().isEmpty()
     assert not errors
 
 

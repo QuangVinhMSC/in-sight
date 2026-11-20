@@ -28,6 +28,8 @@ SCRATCH = {
     "Z594": 'ListBox("one","two","three")',
     "Z595": "1/0",
 }
+# written by single tests (and cleared with the rest)
+EXTRA = ["X590", "X591", "X592", "X593"]
 
 
 def run(coro, timeout=20000):
@@ -45,13 +47,13 @@ def device(qapp):
     if dev.read_only:
         run(dev.disconnect_from())
         pytest.skip("an editor (ISVS) is attached")
-    occupied = [loc for loc in SCRATCH if loc in dev.expressions]
+    occupied = [loc for loc in list(SCRATCH) + EXTRA if loc in dev.expressions]
     if occupied:
         run(dev.disconnect_from())
         pytest.skip(f"scratch cells already in use: {occupied}")
     yield dev
-    run(dev.set_cell_expressions({loc: "" for loc in SCRATCH}))
-    assert not [loc for loc in SCRATCH if loc in dev.expressions], "scratch cells not cleared"
+    run(dev.set_cell_expressions({loc: "" for loc in list(SCRATCH) + EXTRA}))
+    assert not [loc for loc in list(SCRATCH) + EXTRA if loc in dev.expressions], "scratch cells not cleared"
     run(dev.disconnect_from())
 
 
@@ -115,3 +117,50 @@ def test_download_job_is_a_jobx(device):
     data = run(device.download_job(name))
     with tarfile.open(fileobj=io.BytesIO(data)) as tf:
         assert "Job.json" in tf.getnames()
+
+
+def test_editing_objects(device):
+    """beginEdit's Editing object: $type and flag names per Edit* function (plan §8.10)."""
+    from insight_studio.editors import edit_flags, editing_function
+
+    exprs = {"X590": 'EditMaskedRegion($A$0,0,0,0,1,1,1,1,1,1,1,"M",2)',
+             "X591": 'EditCompositeRegion($A$0,0,0,0,1,1,0,1,1,"C",2)',
+             "X592": 'EditPolygon($A$0,0,0,0,0,1,1,1,1,1,"P",2)'}
+    run(device.set_cell_expressions(exprs))
+    res = device.cell_results()
+    assert res["X590"]["caption"] == "M" and "name" not in res["X590"]
+    found = {}
+    for loc in exprs:
+        editing = run(device.begin_edit(loc))
+        run(device.end_edit())
+        found[loc] = (editing_function(editing), edit_flags(editing))
+    assert found["X590"][0] == "EditMaskedRegion" and found["X590"][1]["addRegion"] is True
+    assert found["X591"][0] == "EditCompositeRegion" and found["X591"][1]["editRegion"] is False
+    assert found["X592"][0] == "EditPolygon" and found["X592"][1]["addPoints"] is False
+
+
+def test_refused_expression_stays_as_text(device):
+    with pytest.raises(Exception):
+        run(device.set_cell_expression("X593", 'EditMaskedRegion($A$0,0,0,0,1,1,1,1,1,1,"M",2)'))
+    run(device.refresh_expressions())
+    assert device.expressions["X593"]["expr"].startswith("'#EditMaskedRegion(")
+
+
+def test_curved_region_drawn_like_graphics(device):
+    """The device's SVG layer draws a curved region where graphics.region_point puts it."""
+    import re
+
+    from insight_studio import graphics
+
+    run(device.set_cell_expressions({"X590": 'EditRegion($A$0,0,0,0,1,1,1,1,"R",2)'}))
+    g = dict(cells.editable_graphic(device.cell_results()["X590"]), x=200.0, y=150.0, w=300.0, h=200.0,
+             angle=20.0, curve=30.0)
+    run(device.set_cell_value("X590", g))
+    run(device.trigger())
+    layers = run(device.latest_result())["acqImageView"]["layers"]
+    svg = bytes(wait(device.http_get(next(L["url"] for L in layers if L["$type"] == "SVGLayer")), 20000)).decode()
+    body = re.search(r'<g data-c="X590".*?</g>', svg, re.S).group(0)
+    outline = re.search(r'<path d="([^"]*)" stroke="#FF0000"', body).group(1)
+    nums = [float(v) for v in re.findall(r"-?\d+(?:\.\d+)?", outline)]
+    corner = graphics.region_point(g, 300, 200)  # the path starts at the far corner of the bottom arc
+    assert abs(nums[0] - corner.x()) < 0.2 and abs(nums[1] - corner.y()) < 0.2

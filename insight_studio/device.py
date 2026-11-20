@@ -528,9 +528,17 @@ class InSightDevice(QObject):
             "name": filename,
             "content": base64.b64encode(data).decode("ascii"),
         }
-        await self.http_post(self._http_session_url("loadJobData"),
-                             json.dumps(payload).encode("utf-8"), "application/json",
-                             timeout_ms=120000)
+        try:
+            await self.http_post(self._http_session_url("loadJobData"),
+                                 json.dumps(payload).encode("utf-8"), "application/json",
+                                 timeout_ms=120000)
+        except DeviceError as e:
+            # The IS8902CX answers 404 while an editor (In-Sight Vision Suite) is attached (§8.6).
+            if "404" not in str(e):
+                raise
+            sure = "is" if self.editor_attached else "may be"
+            raise DeviceError(f"The vision system did not load the job: an editor (In-Sight Vision Suite) "
+                              f"{sure} attached to it. Close the editor and try again. ({e})") from e
 
     async def load_image(self, data: bytes, content_type: str, name: str = "") -> None:
         """Loads a BMP/JPEG image as the current image (HTTP POST loadImage)."""

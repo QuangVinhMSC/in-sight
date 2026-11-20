@@ -104,6 +104,45 @@ def test_default_expression(catalog):
     info = FunctionInfo("Tool", None, "x", inputs=[{"name": "Image", "kind": "image"},
                                                      {"name": "Patterns", "kind": "text"}])
     assert default_expression(info) is None                               # no default for Patterns
+    # rejected by the IS8902CX (2026-11-20) when built from mis-parsed help tables: no default now
+    for name in ("Timer", "ReadDiscrete", "FormatInputBuffer", "CountPassFail", "Status",
+                 "TransFixtureToPixel", "ScaleColorImage", "WhiteBalance", "WriteMessage"):
+        assert default_expression(catalog.get(name), (800, 600)) is None, name
+    assert default_expression(catalog.get("MultiStatus")) == "MultiStatus(0,0,10,0,0xFF0000,0x00FF00)"
+    # the camera needs the fixture's Theta in EditMaskedRegion (13 arguments)
+    assert len(default_expression(catalog.get("EditMaskedRegion")).split(",")) == 13
+
+
+def test_default_expressions_are_what_isvs_writes(catalog):
+    """Survey on Windows, 2026-11-20 (§3): the formula bar after inserting each tool and pressing OK.
+    ISVS does not scale the default region to the image (1920×552 on the IS8902CX)."""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+    import isvs_sheets
+    for name, expr in isvs_sheets.ISVS_DEFAULTS.items():
+        assert default_expression(catalog.get(name), (1920, 552)) == expr, name
+
+
+def test_isvs_sheet_types(catalog):
+    """Integer vs. 3-decimal fields and choice values as ISVS shows them (survey §2, §4)."""
+    from insight_studio.property_sheet import is_integer_parameter
+
+    def leaf(fn, name):
+        for p in catalog.get(fn).inputs:
+            for q in p.get("children") or [p]:
+                if q["name"] == name:
+                    return q
+        raise KeyError(name)
+
+    assert is_integer_parameter(leaf("FindLine", "Accept Thresh"))
+    assert not is_integer_parameter(leaf("FindBlobs", "Accept Thresh"))
+    assert is_integer_parameter(leaf("Caliper", "Edge Width")) and is_integer_parameter(leaf("DetectBlobs", "Threshold"))
+    assert not is_integer_parameter(leaf("TrainPatMaxRedLine", "Coarse Granularity"))
+    assert is_integer_parameter(leaf("FindPatMaxRedLine", "Timeout"))
+    assert {o["value"]: o["label"] for o in leaf("WriteImage", "Storage")["options"]} == {
+        0: "Local Device", 1: "FTP Server", 2: "SFTP Server", 3: "TCP Server"}
+    assert leaf("Filter", "Auto Threshold")["kind"] == "bool"
 
 
 # ---------------------------------------------------------------------------- help parsing
@@ -134,7 +173,7 @@ def test_toc_parser():
 # ---------------------------------------------------------------------------- widgets
 def test_insert_function_dialog(catalog, qapp):
     dlg = InsertFunctionDialog(catalog, "B2")
-    assert dlg.windowTitle() == f"Insert Function {cells.STRUCTURE_GLYPH}Inspection"
+    assert dlg.windowTitle() == "Insert Function - Inspection"
     assert (dlg.width(), dlg.height()) == (674, 432)
     assert dlg.all_item.isExpanded()
     assert [dlg.all_item.child(i).text(0) for i in range(dlg.all_item.childCount())] == ISVS_TOP
@@ -195,9 +234,8 @@ def test_insert_tool_opens_property_sheet_cancel_restores(offline, qapp):
     win.sheet.select_location("D5")
     win.insert_function_into("D5", win.catalog.get("TrainPatMaxRedLine"))
     pump_until(qapp, lambda: win.property_sheet is not None)
-    w, h = win._image_size()
-    x, y = round((w - 440) / 2), round((h - 320) / 2)
-    assert fake.expressions["D5"].startswith(f"TrainPatMaxRedLine($A$0,0,0,0,{x},{y},440,320,0,0,")
+    # ISVS's fixed default region, whatever the image size
+    assert fake.expressions["D5"].startswith("TrainPatMaxRedLine($A$0,0,0,0,180,140,440,320,0,0,")
     ps = win.property_sheet
     assert ps.location == "D5" and ps.original_expression == ""
     ps.reject()                                                   # Cancel: the cell is empty again
@@ -275,3 +313,18 @@ def test_insert_function_dialog_from_window(offline, qapp, monkeypatch):
     monkeypatch.setattr(InsertFunctionDialog, "exec", fake_exec)
     win.insert_function()
     assert chosen and win.formula.text() == "Sqrt()"
+
+
+def test_insert_refused_default_restores_cell(offline, qapp):
+    """The device keeps a refused expression as text ('#…): the cell gets its old content back
+    and the function goes to the formula bar."""
+    win, fake, errors = offline
+    win._paste_cells({"E3": "5"})
+    pump_until(qapp, lambda: win.model.expressions.get("E3") == "5")
+    bad = FunctionInfo("EditMaskedRegion", None, "x", template='EditMaskedRegion($A$0,0,0,0,1,1,1,1,1,1,"M",2)',
+                       inputs=[{"name": "Image", "kind": "image"}])
+    win.sheet.select_location("E3")
+    win.insert_function_into("E3", bad)
+    pump_until(qapp, lambda: win.formula.text().startswith("EditMaskedRegion("))
+    assert fake.expressions.get("E3") == "5" and win.model.expressions.get("E3") == "5"
+    assert win.property_sheet is None and not errors

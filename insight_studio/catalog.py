@@ -227,8 +227,9 @@ def _num(v: float) -> str:
 
 
 def _region_args(children: list[dict], size: tuple[int, int]) -> list[Optional[str]]:
-    """Default geometry of a region-like group, centred on the image as ISVS does
-    (TrainPatMaxRedLine on 800×600: Pattern Region = (180,140,440,320,0,0))."""
+    """Default geometry of a region-like group as ISVS writes it: centred on an 800×600 image and
+    440×320 unless the tool has its own size (FindLine/Caliper 200×50) — fixed numbers, also on the
+    IS8902CX's 1920×552 image (survey 2026-11-20)."""
     w, h = size
     names = [c["name"].lower() for c in children]
     defaults = {c["name"].lower(): c.get("default") for c in children}
@@ -239,7 +240,7 @@ def _region_args(children: list[dict], size: tuple[int, int]) -> list[Optional[s
 
     out: list[Optional[str]] = []
     if "width" in names and "height" in names:
-        rw, rh = num("width", w / 2), num("height", h / 2)
+        rw, rh = num("width", 440.0), num("height", 320.0)
         geo = {"x": (w - rw) / 2, "y": (h - rh) / 2, "width": rw, "height": rh}
     elif any("radius" in n for n in names):
         r = min(w, h)
@@ -250,13 +251,38 @@ def _region_args(children: list[dict], size: tuple[int, int]) -> list[Optional[s
                "x0": w / 4, "y0": h / 2, "x1": 3 * w / 4, "y1": h / 2}
     for c in children:
         key = c["name"].lower()
+        d = c.get("default")
         if key in geo:
-            out.append(_num(geo[key]) if key not in defaults or defaults[key] is None
-                       or key in ("x", "y") else defaults[key])
+            out.append(_num(geo[key]) if d is None or key in ("x", "y") else d)
+        elif d is not None and _NUMBER.fullmatch(d.strip()):
+            out.append(d.strip())
+        elif key in ("angle", "curve", "theta"):
+            out.append("0")
         else:
-            d = c.get("default")
-            out.append(d if d is not None and _NUMBER.fullmatch(d.strip()) else "0")
+            out.append(None)  # not a geometry field: the help table was not parsed as expected
     return out
+
+
+def _group_args(p: dict) -> list[Optional[str]]:
+    """Defaults of a parameter group (Fixture, Pattern Origin, …). A group whose children have
+    neither a numeric default nor choices is usually a help value table parsed as parameters
+    (FindBlobs' "Relation of Angle Values", Timer's time strings…): no default then."""
+    fixture = p.get("name", "").lower() == "fixture"
+    out: list[Optional[str]] = []
+    for c in p["children"]:
+        d = c.get("default")
+        if c.get("options"):
+            out.append(_leaf_arg(c))
+        elif d is not None and _NUMBER.fullmatch(d.strip()):
+            out.append(d.strip())
+        elif fixture and c["name"].lower() in ("x", "y", "theta"):
+            out.append("0")
+        else:
+            out.append(None)
+    return out
+
+
+_HEX = re.compile(r"0x[0-9A-Fa-f]+")
 
 
 def _leaf_arg(p: dict) -> Optional[str]:
@@ -271,12 +297,17 @@ def _leaf_arg(p: dict) -> Optional[str]:
             return default.strip()
         return str(d if d is not None else p["options"][0]["value"])
     if kind == "event":
+        if default is not None and default.strip():
+            return default.strip()  # read in ISVS (isvs_sheets)
         # an acquisition event retrains / resets on every image: start those without an event
         return "0" if any(w in name for w in ("train", "reset", "clear")) else "$A$0"
     if default is not None and _NUMBER.fullmatch(default.strip()):
         return default.strip()
     if kind == "reference":
-        return "0"  # e.g. External Region = 0 (ISVS property sheet)
+        # External Region = 0 (ISVS property sheet); other references (Blobs, String…) need a cell
+        return "0" if "region" in name else None
+    if default is not None and _HEX.match(default.strip()):
+        return _HEX.match(default.strip()).group(0)  # "0xFF0000 (red)" -> a colour number
     if default is not None and default.strip() and not default.strip().startswith(("$", "'")):
         return '"' + default.strip().strip('"').replace('"', '""') + '"'
     return None
@@ -284,7 +315,8 @@ def _leaf_arg(p: dict) -> Optional[str]:
 
 def default_expression(info: FunctionInfo, image_size: Optional[tuple[int, int]] = None) -> Optional[str]:
     """The expression a newly inserted tool starts with before its property sheet opens: the
-    help's defaults, the image in ``$A$0``, a zero fixture and a region centred on the image.
+    help's defaults (or the ones read in ISVS), the image in ``$A$0``, a zero fixture and ISVS's
+    fixed default region. ``image_size`` is ignored: ISVS does not scale regions to the image.
 
     None when a parameter has no default the help states (then the function name goes to the
     formula bar instead, as for functions without a property sheet).
@@ -293,7 +325,7 @@ def default_expression(info: FunctionInfo, image_size: Optional[tuple[int, int]]
         return info.template
     if not info.inputs:
         return None
-    size = image_size if image_size and image_size[0] > 0 and image_size[1] > 0 else DEFAULT_IMAGE_SIZE
+    size = DEFAULT_IMAGE_SIZE
     args: list[Optional[str]] = []
     for p in info.inputs:
         children = p.get("children")
@@ -302,12 +334,7 @@ def default_expression(info: FunctionInfo, image_size: Optional[tuple[int, int]]
         elif p.get("kind") == "region":
             args += _region_args(children, size)
         else:  # Fixture, Pattern Origin, …
-            for c in children:
-                d = c.get("default")
-                if c.get("options"):
-                    args.append(_leaf_arg(c))
-                else:
-                    args.append(d.strip() if d is not None and _NUMBER.fullmatch(d.strip()) else "0")
+            args += _group_args(p)
     if any(a is None for a in args):
         return None
     return f"{info.name}({','.join(args)})"

@@ -119,6 +119,8 @@ class FakeInSight(QObject):
         m = re.match(r"^/cam0/img/(\d+)$", path)
         if method == "GET" and m:
             return 200, "image/png", self._render_image(int(m.group(1)))
+        if method == "POST" and path.endswith("/loadJobData") and self.editor_attached:
+            return 404, "text/plain", b"not found"  # like the IS8902CX while ISVS is attached
         if method == "POST" and path.endswith("/loadJobData"):
             try:
                 content = json.loads(body.decode("utf-8"))
@@ -184,6 +186,10 @@ class FakeInSight(QObject):
         except PermissionError as e:
             if rid:
                 self._send(ws, {"$type": "resp", "id": rid, "error": -1610311888, "body": str(e)})
+            return
+        except SyntaxError as e:  # setCellExpression refused by the parser
+            if rid:
+                self._send(ws, {"$type": "resp", "id": rid, "error": -1610357770, "body": str(e)})
             return
         if rid:
             resp: dict[str, Any] = {"$type": "resp", "id": rid}
@@ -282,6 +288,11 @@ class FakeInSight(QObject):
                 self.names.pop(loc, None)
                 self.conditions.pop(loc, None)
                 self.values.pop(loc, None)
+            elif not _arity_ok(expr):
+                # like the IS8902CX: refused, but the text stays in the cell as a string
+                self.expressions[loc] = "'#" + expr.strip()
+                self._new_result()
+                raise SyntaxError("Error occurred")
             else:
                 self.expressions[loc] = expr
             self._new_result()
@@ -331,7 +342,7 @@ class FakeInSight(QObject):
             data = cell.get("data")
             if not isinstance(data, dict):
                 return self._result()["acqImageView"]
-            return {"$type": f"Editing{data['$type']}", "url": "/cam0/app/editing/1", "data": data}
+            return _editing_object(self.expressions.get(loc, ""), data, cell.get("caption", ""))
         if member == "createNewJob":
             self.reset_job()
             self.job_name = "untitled.jobx"
@@ -480,7 +491,9 @@ class FakeInSight(QObject):
         if fn in _EDIT_GRAPHICS:
             data = dict(stored) if isinstance(stored, dict) else json.loads(json.dumps(_EDIT_GRAPHICS[fn]))
             data.setdefault("color", -16711936)
-            return {"$type": "HmiButtonResult", "data": data, "caption": fn, "name": fn, "editable": True}
+            # the caption is the Name argument (second to last); results carry no function name
+            caption = args[-2].strip('"') if len(args) >= 2 else fn
+            return {"$type": "HmiButtonResult", "data": data, "caption": caption, "editable": True}
         # arithmetic over numbers, cell references and cell names
         def ref(m: re.Match) -> str:
             a = m.group(0).replace("$", "")
@@ -531,9 +544,52 @@ _EDIT_GRAPHICS = {
     "EditPolygon": {"$type": "Polygon", "points": [300.0, 150.0, 400.0, 300.0, 200.0, 300.0], "length": 3},
     "EditCompositeRegion": {"$type": "CompositeRegion", "subregions": [
         {"$type": "SubRegion", "add": True, "shape": _REGION}]},
-    "EditMaskedRegion": {"$type": "CompositeRegion", "subregions": [
-        {"$type": "SubRegion", "add": True, "shape": _REGION}]},
+    "EditMaskedRegion": {"$type": "CompositeRegion", "subregions": [  # the device's default: ROI + one mask
+        {"$type": "SubRegion", "add": True, "shape": dict(_REGION, y=135.0, h=50.0)},
+        {"$type": "SubRegion", "add": False, "shape": dict(_REGION, x=110.0, y=135.0, w=10.0, h=50.0)}]},
+    "EditPolylinePath": {"$type": "CompositeRegion", "subregions": [
+        {"$type": "SubRegion", "add": True, "shape": dict(_REGION, h=50.0)},
+        {"$type": "SubRegion", "add": True, "shape": dict(_REGION, x=340.0, h=50.0, angle=30.0)}]},
 }
+
+# Argument counts the IS8902CX accepts (2026-11-20); EditMaskedRegion needs the fixture's Theta although
+# the help's syntax line leaves it out.
+_ARITY = {"EditRegion": 10, "EditCircle": 8, "EditAnnulus": 8, "EditPolygon": 12, "EditCompositeRegion": 11,
+          "EditMaskedRegion": 13, "EditPolylinePath": 12}
+
+# beginEdit's Editing object per function: its $type and the flag names, in argument order after the
+# fixture (Image, X, Y, Theta, flags…, Name, Show).
+_EDITING = {
+    "EditRegion": ("EditingRegion", ("move", "resize", "rotate", "bend")),
+    "EditCircle": ("EditingCircle", ("move", "resize")),
+    "EditAnnulus": ("EditingAnnulus", ("move", "resize")),
+    "EditPolygon": ("EditingPolygon", ("addPoints", "removePoints", "movePoints", "move", "scale", "rotate")),
+    "EditPolylinePath": ("EditingPolyline", ("addPoints", "removePoints", "movePoints", "move", "scale", "rotate")),
+    "EditCompositeRegion": ("EditingCompositeRegion", ("addRegions", "removeRegions", "editRegions", "move", "rotate")),
+    "EditMaskedRegion": ("EditingMaskedRegion", ("addRegion", "removeRegion", "editRegion", "move", "resize",
+                                                 "rotate", "bend")),
+}
+
+
+def _arity_ok(expr: str) -> bool:
+    fn = cells.function_name(expr.strip())
+    if fn not in _ARITY:
+        return True
+    e = expr.strip()
+    return len(_split_args(e[e.find("(") + 1:e.rfind(")")])) == _ARITY[fn]
+
+
+def _editing_object(expr: str, data: dict, caption: str) -> dict:
+    fn = cells.function_name(expr.strip()) or ""
+    type_name, flags = _EDITING.get(fn, (f"Editing{data['$type']}", ()))
+    e = expr.strip()
+    args = _split_args(e[e.find("(") + 1:e.rfind(")")]) if fn else []
+    out = {"$type": type_name, "url": "/cam0/app/editing/1", "data": data, "title": caption,
+           "bounds": {"$type": "Rectangle", "x": 0.0, "y": 0.0, "w": float(IMG_W), "h": float(IMG_H)},
+           "fixture": {"$type": "Fixture", "x": 0.0, "y": 0.0, "angle": 0.0}}
+    for name, arg in zip(flags, args[4:]):
+        out[name] = arg.strip() not in ("0", "")
+    return out
 
 
 def _split_args(text: str) -> list[str]:

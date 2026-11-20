@@ -58,12 +58,14 @@ def test_insert_row_moves_cells_names_states_values_and_undo(sheet, qapp):
     assert not errors
 
 
-def test_delete_shift_up_makes_ref_errors(sheet, qapp):
+def test_delete_keeps_references_to_deleted_cells(sheet, qapp):
+    """ISVS (survey 2026-11-20): no #REF — a reference to a deleted cell keeps its text and then
+    points at the cell that moved into its place; references to moved cells follow them."""
     win, fake, errors = sheet
     win.apply_insert_delete((1, 0, 1, 0), ops.SHIFT_UP, delete=True)    # delete A1
     pump_until(qapp, lambda: fake.expressions.get("A1") == "EditInt(0,100)")
     _idle(win, qapp)
-    assert fake.expressions["B3"] == "#REF+1" and fake.expressions["C3"] == "$A$1*2"
+    assert fake.expressions["B3"] == "A1+1" and fake.expressions["C3"] == "$A$1*2"
     assert "A2" not in fake.expressions and fake.conditions == {"B3": "A1"}
     assert fake.names == {"A0": "Image"}                    # the named cell was deleted
     assert fake.values.get("A1") == 7
@@ -217,9 +219,87 @@ def test_insert_relative_range_while_editing_formula_bar(sheet, qapp):
 
 def test_insert_delete_dialog(qapp):
     dlg = InsertDeleteDialog(delete=False)
-    assert dlg.windowTitle() == "Insert ❒Inspection" and dlg.mode() == ops.SHIFT_DOWN
+    assert dlg.windowTitle() == "Insert - Inspection" and dlg.mode() == ops.SHIFT_DOWN
     assert [b.text() for b in dlg.buttons.values()] == ["Shift cells right", "Shift cells down", "Entire row",
                                                         "Entire column"]
     dlg = InsertDeleteDialog(delete=True, default=ops.ENTIRE_COLUMN)
-    assert dlg.windowTitle() == "Delete ❒Inspection" and dlg.mode() == ops.ENTIRE_COLUMN
+    assert dlg.windowTitle() == "Delete - Inspection" and dlg.mode() == ops.ENTIRE_COLUMN
     assert dlg.buttons[ops.SHIFT_LEFT].text() == "Shift cells left"
+
+
+def test_copy_paste_copies_names_with_a_suffix(sheet, qapp):
+    """ISVS (survey §6.5): Copy copies the cell name; the copy gets a free one (Five_1)."""
+    win, fake, errors = sheet
+    _select(win, (1, 0, 1, 0))                              # A1 "5", named Five
+    win.copy_cells()
+    win.sheet.select_location("E1")
+    win.sheet.paste()
+    pump_until(qapp, lambda: fake.expressions.get("E1") == "5" and fake.names.get("E1"))
+    _idle(win, qapp)
+    assert fake.names["E1"] == "Five_1" and fake.names["A1"] == "Five"
+    assert not errors
+
+
+# ---------------------------------------------------------------------------- Cell Names / Cell State (phase 6)
+def test_cell_names_dialog_rules(qapp):
+    from insight_studio.cell_dialogs import CellNamesDialog, suggested_name, valid_cell_name
+    assert suggested_name([]) == "Result" and suggested_name(["Result"]) == "Result01"
+    assert not valid_cell_name("1abc") and not valid_cell_name("A1") and valid_cell_name("myval")
+    dlg = CellNamesDialog({"A1": "Five", "B3": "Sum"}, current="C3")
+    assert dlg.windowTitle() == "Cell Names"
+    assert [dlg.table.horizontalHeaderItem(i).text() for i in range(2)] == ["Name", "Location"]
+    assert [b.text() for b in (dlg.add_button, dlg.rename_button, dlg.delete_button, dlg.auto_button)] == [
+        "Add", "Rename", "Delete", "Auto Name"]
+    assert dlg.names() == {"A1": "Five", "B3": "Sum", "C3": "Result"}   # a row for the cell, suggested name
+    item = dlg.table.item(2, 0)
+    item.setText("1abc")                                                # invalid: silently reverted
+    assert item.text() == "Result"
+    item.setText("myval")
+    dlg.table.selectRow(0)
+    dlg._delete()                                                       # Five removed
+    assert dlg.changes() == {"A1": "", "C3": "myval"}
+
+
+def test_cell_names_and_cell_state_write_to_the_device(sheet, qapp, monkeypatch):
+    win, fake, errors = sheet
+    win.sheet.select_location("C3")
+    win.act_name.trigger()
+    dlg = win.cell_names_dialog
+    assert dlg.isVisible() and dlg.names()["C3"] == "Result"
+    dlg.accept()
+    pump_until(qapp, lambda: fake.names.get("C3") == "Result")
+    _idle(win, qapp)
+    menu = win.build_cell_menu()
+    assert any(a.text() == "Edit Cell Name…" for a in menu.actions())  # ISVS: on a named cell
+
+    _select(win, (3, 1, 3, 2))                                          # B3:C3
+    assert win.act_cell_state.isEnabled()
+    win.act_cell_state.trigger()
+    pump_until(qapp, lambda: getattr(win, "cell_state_dialog", None) is not None
+               and win.cell_state_dialog.isVisible())
+    dlg = win.cell_state_dialog
+    assert dlg.windowTitle() == "Cell State - Inspection" and dlg.conditional.isChecked()  # B3's state is "A2"
+    assert dlg.relative.isChecked() and dlg.reference.text() == "A2"
+    dlg.disabled.setChecked(True)
+    dlg.accept()
+    pump_until(qapp, lambda: fake.conditions.get("B3") == "0" and fake.conditions.get("C3") == "0")
+    _idle(win, qapp)
+    win.sheet.select_location("B3")
+    pump_until(qapp, lambda: win.state_indicator.text() == "if 0")     # ISVS live/123
+    win.undo()                                                          # one Undo step
+    pump_until(qapp, lambda: fake.conditions.get("B3") == "A2")
+    assert not errors
+
+
+def test_cell_state_dialog_ok_needs_a_reference(qapp):
+    from PySide6.QtWidgets import QDialogButtonBox
+    from insight_studio.cell_dialogs import CellStateDialog
+    dlg = CellStateDialog("B1", "")
+    ok = dlg.buttons.button(QDialogButtonBox.StandardButton.Ok)
+    assert dlg.enabled.isChecked() and ok.isEnabled() and dlg.condition() == ""
+    dlg.conditional.setChecked(True)
+    assert not ok.isEnabled()                                           # ISVS live/122
+    dlg.set_reference("$D$4:E5")
+    assert ok.isEnabled() and dlg.condition() == "$D$4"                 # Absolute is the default
+    dlg.relative.setChecked(True)
+    assert dlg.condition() == "D4"

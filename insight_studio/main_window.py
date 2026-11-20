@@ -14,12 +14,12 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QDockWidget,
     QFileDialog,
     QFormLayout,
     QFrame,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QMainWindow,
     QMenu,
@@ -37,7 +37,7 @@ from PySide6.QtWidgets import (
 
 from . import __version__, cells, icons
 from . import sheet_ops as ops
-from .cell_dialogs import FindDialog, InsertDeleteDialog
+from .cell_dialogs import CellNamesDialog, CellStateDialog, FindDialog, InsertDeleteDialog
 from .catalog import Catalog, Category, FunctionInfo, default_expression, editor_versions, find_help_file, help_file
 from .property_sheet import PropertySheet, is_training_function, split_call
 from .cell_controls import SheetDelegate
@@ -46,7 +46,7 @@ from .cogsocket import CogSocketError
 from .device import DeviceError, InSightDevice
 from .dialogs import ConnectDialog, DeviceFilesDialog
 from .functions_ui import FunctionsPanel, InsertFunctionDialog
-from .editors import edit_flags, round_graphic
+from .editors import edit_flags, editing_function, round_graphic
 from .image_view import TEXT_FIXED, TEXT_SCALE_MODES, ImageView
 from .qtasync import Future, set_unhandled_error_hook, spawn
 from .sheet import RESULT_ROLE, SheetModel, SheetView
@@ -83,7 +83,8 @@ class MainWindow(QMainWindow):
         self.catalog = Catalog.load()
         self._result_gen = 0
         self._editing_location: Optional[str] = None
-        self._param_edit: Optional[PropertySheet] = None  # sheet whose region is edited on the image
+        self._param_edit: Optional[PropertySheet] = None  # sheet whose region is drawn on the image
+        self._param_igm: Optional[PropertySheet] = None  # sheet whose region is in Interactive Graphics Mode (F9)
         self._log_traffic = False
         self._job_name = ""
         self.property_sheet: Optional[PropertySheet] = None
@@ -153,10 +154,14 @@ class MainWindow(QMainWindow):
         self.formula.returnPressed.connect(self._commit_formula_bar)
         self.formula.textEdited.connect(lambda _t: self._update_accept_cancel())
         self.formula.installEventFilter(self)
-        # Cell state indicator next to the formula bar (filled in by the Cell State feature).
+        # Cell state indicator at the right of the formula bar: "if 1" enabled, "if 0" disabled, "if <cell>"
+        # conditional (ISVS live/123)
         self.state_indicator = QLabel("")
         self.state_indicator.setObjectName("stateIndicator")
         self.state_indicator.setMinimumWidth(24)
+        self.state_indicator.setStyleSheet("color:#5aa0ff")
+        self._state_timer = QTimer(self, singleShot=True, interval=150)
+        self._state_timer.timeout.connect(self._update_state_indicator)
 
         self.banner = QLabel()
         self.banner.setObjectName("banner")
@@ -324,7 +329,7 @@ class MainWindow(QMainWindow):
         self.act_edit_graphic = A("Edit Cell Graphic", self.edit_graphic, "F9", "edit_graphic")
         self.act_maximize = A("Maximize Cell Region", lambda: self.maximize_region(), "Ctrl+Shift+M",
                               "maximize_region")
-        self.act_cell_state = A("Edit Cell State", None, None, "cell_state", note=NOT_YET, enabled=False)
+        self.act_cell_state = A("Edit Cell State", self.edit_cell_state, None, "cell_state")
         self.act_comment = A("Insert Comment…", None, None, "comment", note=NO_COMMENT, enabled=False)
         self.act_name = A("Insert Cell Name…", self.set_cell_name, None, "cell_name")
         self.act_accept = A("Accept Changes", self.accept_changes, None, "accept", tip_keys="Return")
@@ -793,8 +798,10 @@ class MainWindow(QMainWindow):
         loc = self.sheet.current_location()
         result = self.model.results.get(loc) if loc else None
         self.act_insert.setEnabled(offline and not editing)
-        # ISVS: Insert Cell Name… needs a cell with contents
+        # ISVS: Insert Cell Name… and Cell State… need a cell with contents
         self.act_name.setEnabled(offline and not editing and bool(self.model.expressions.get(loc or "")))
+        self.act_cell_state.setEnabled(offline and not editing and d.conditions_supported
+                                       and any(self.model.expressions.get(x) for x in self.sheet.selected_locations()))
         selecting = self.sheet.in_selection_mode
         has_selection = bool(loc) and not editing and not selecting
         self.act_copy.setEnabled(has_selection)
@@ -843,7 +850,7 @@ class MainWindow(QMainWindow):
 
     def _update_accept_cancel(self) -> None:
         """Accept/Cancel Changes: active while a graphic or the formula bar is being edited."""
-        editing = self._editing_location is not None
+        editing = self._editing_location is not None or self._param_igm is not None
         active = editing or self._formula_modified() or self._cell_editing()
         self.act_accept.setEnabled(active)
         self.act_cancel.setEnabled(active)
@@ -852,7 +859,9 @@ class MainWindow(QMainWindow):
         self.act_cancel.setShortcut(QKeySequence("Escape") if editing else QKeySequence())
 
     def accept_changes(self) -> None:
-        if self._editing_location is not None:
+        if self._param_igm is not None:
+            self._end_param_igm(True)
+        elif self._editing_location is not None:
             self.accept_graphic()
         elif self.sheet.commit_editor():
             pass
@@ -860,7 +869,9 @@ class MainWindow(QMainWindow):
             self._commit_formula_bar()
 
     def cancel_changes(self) -> None:
-        if self._editing_location is not None:
+        if self._param_igm is not None:
+            self._end_param_igm(False)
+        elif self._editing_location is not None:
             self.cancel_graphic()
         elif self.sheet.cancel_editor():
             self._on_current_cell()
@@ -995,7 +1006,27 @@ class MainWindow(QMainWindow):
         self.formula.setText(self.model.expressions.get(loc, ""))
         self.formula.setProperty("location", loc)
         self._show_cell_format(loc)
+        self._state_timer.start()
         self._update_actions()
+
+    def _update_state_indicator(self) -> None:
+        """Shows the active cell's state ("if 1" / "if 0" / "if B3"); read from the device."""
+        loc = self.sheet.current_location()
+        d = self.device
+        if not loc or not d.connected or not d.conditions_supported:
+            self.state_indicator.setText("")
+            return
+        if not self.model.expressions.get(loc):
+            self.state_indicator.setText("if 1")
+            return
+
+        async def go() -> None:
+            conds = await d.get_cell_conditions([loc])
+            if self.sheet.current_location() == loc:
+                cond = conds.get(loc, "")
+                self.state_indicator.setText(f"if {cond or '1'}")
+
+        spawn(go(), report_errors=False)
 
     def _show_cell_format(self, loc: str) -> None:
         """Mirrors the (read-only) format of the active cell in the formatting toolbar."""
@@ -1078,8 +1109,10 @@ class MainWindow(QMainWindow):
                 for loc in locs}
 
     def _apply_change(self, label: str, targets: dict[str, CellState], record: bool = True,
-                      before: Optional[dict[str, CellState]] = None, log: Optional[str] = None):
-        """Writes target cell states to the device and records them for Undo."""
+                      before: Optional[dict[str, CellState]] = None, log: Optional[str] = None,
+                      report: bool = True):
+        """Writes target cell states to the device and records them for Undo. With ``report``
+        False a failure is only logged (the caller handles it)."""
         if not targets or self.model.read_only and record:
             return None
         for loc, t in targets.items():
@@ -1107,7 +1140,11 @@ class MainWindow(QMainWindow):
                 self._update_actions()
                 done.set_result(None)
 
-        return self.run(go(), label)
+        if report:
+            return self.run(go(), label)
+        fut = spawn(go(), report_errors=False)
+        fut.add_done_callback(lambda f: f.exception() is not None and self.log(f"{label}: {f.exception()}"))
+        return fut
 
     async def _writes_done(self) -> None:
         while self._write_tail is not None and not self._write_tail.done():
@@ -1127,7 +1164,8 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ clipboard
     def copy_cells(self) -> None:
-        """Copy: expressions and cell states (states copy like references)."""
+        """Copy: expressions, names and cell states (states copy like references; a pasted name
+        that is in use gets a suffix from the vision system, as in ISVS: Result_1)."""
         if not self.sheet.copy_selection():
             return
         block = self.sheet.selection_block()
@@ -1170,8 +1208,9 @@ class MainWindow(QMainWindow):
                 continue
             new_expr = cells.shift_references(expr, d_row, d_col) if doc.get("source") else expr
             cond = (doc.get("conditions") or {}).get(key, "") if self.device.conditions_supported else None
+            name = (doc.get("names") or {}).get(key) if new_expr else None
             targets[cells.address(rr, cc)] = CellState(
-                new_expr, condition=ops.shift_condition(cond, d_row, d_col) if new_expr else None)
+                new_expr, name=name or None, condition=ops.shift_condition(cond, d_row, d_col) if new_expr else None)
         self._apply_change("Paste", targets, log=f"Pasted {len(targets)} cell(s)")
 
     def _move_cut_cells(self, source: ops.Block, tr: int, tc: int) -> None:
@@ -1233,16 +1272,18 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, APP_NAME, "Cannot shift non-empty cells off the spreadsheet:\n"
                                     + ", ".join(lost[:12]) + (" …" if len(lost) > 12 else ""))
                 return None
-        return self._move_cells(f"{verb} {what}", mapping)
+        return self._move_cells(f"{verb} {what}", mapping, keep_removed=delete)
 
-    def _move_cells(self, label: str, mapping: ops.Mapping, select: Optional[ops.Block] = None):
+    def _move_cells(self, label: str, mapping: ops.Mapping, select: Optional[ops.Block] = None,
+                    keep_removed: bool = False):
         """Moves cells (Insert / Delete / Cut + Paste): rewrites every reference, moves names, cell
-        states and control values. Trained data (dataId) and cell formats cannot be moved."""
+        states and control values. Trained data (dataId) and cell formats cannot be moved.
+        ``keep_removed`` (Delete): references to deleted cells are left as they are (ISVS)."""
 
         async def go() -> None:
             await self._writes_done()
             states = await self._sheet_states()
-            targets = ops.plan_move(states, mapping)
+            targets = ops.plan_move(states, mapping, keep_removed=keep_removed)
             if not targets:
                 return
             moved_data = sorted(
@@ -1421,6 +1462,11 @@ class MainWindow(QMainWindow):
         self._update_actions()
         if purpose is None:
             return
+        if purpose["kind"] == "dialog":
+            purpose["dialog"].show()
+            purpose["dialog"].raise_()
+            purpose["done"](text)
+            return
         if purpose["kind"] == "property_sheet":
             sheet = self.property_sheet
             if sheet is not None:
@@ -1536,11 +1582,12 @@ class MainWindow(QMainWindow):
         item(menu, "Insert Relative Reference…", lambda: self.insert_reference(False), "rel_ref",
              self.act_rel_ref.isEnabled())
         item(menu, "Insert Comment…", None, "comment", note=NO_COMMENT)
-        item(menu, "Insert Cell Name…", self.set_cell_name, "cell_name", self.act_name.isEnabled())
+        item(menu, "Edit Cell Name…" if self.model.names.get(loc) else "Insert Cell Name…", self.set_cell_name,
+             "cell_name", self.act_name.isEnabled())
         item(menu, "Insert Getters", note=NOT_YET)
         menu.addSeparator()
         item(menu, "Cell Graphic…", self.edit_graphic, "edit_graphic", self.act_edit_graphic.isEnabled())
-        item(menu, "Cell State…", None, "cell_state", note=NOT_YET)
+        item(menu, "Cell State…", self.edit_cell_state, "cell_state", self.act_cell_state.isEnabled())
         ip = submenu("IP Licensing")
         item(ip, "Protect Cells", note=NO_PROTECT)
         item(ip, "Unprotect Cells", note=NO_PROTECT)
@@ -1658,6 +1705,11 @@ class MainWindow(QMainWindow):
         loc = self.sheet.current_location()
         if not loc:
             return
+        if (cells.function_name(self.model.expressions.get(loc, "")) or "").lower() == "acquireimage":
+            # ISVS (survey §3): on A0 Insert Function brings up the Acquisition tab of the right dock
+            self.acq_dock.show()
+            self.acq_dock.raise_()
+            return
         if self._has_property_sheet(self.model.expressions.get(loc, "")):
             # ISVS: a cell that already holds a function opens its property sheet instead
             self.open_property_sheet(loc)
@@ -1694,7 +1746,7 @@ class MainWindow(QMainWindow):
             return None
         previous = self.model.expressions.get(loc, "")
         fut = self._apply_change(f"Insert {f.name}", {loc: CellState(expr)}, record=False,
-                                 log=f"{loc} ← {expr}")
+                                 log=f"{loc} ← {expr}", report=False)
         if fut is None:
             return None
 
@@ -1705,8 +1757,19 @@ class MainWindow(QMainWindow):
                 self.open_property_sheet(loc, previous=previous)
             else:  # refused by the vision system: let the user complete it in the formula bar
                 self.log(f"{f.name}: the default arguments were refused; complete the function in the formula bar")
-                self.sheet.select_location(loc)
-                self._put_function_in_formula(f)
+                def to_formula(_f=None) -> None:
+                    self.sheet.select_location(loc)
+                    self._put_function_in_formula(f)
+
+                # the device keeps a refused expression as text ('#Name(…)): put the cell back first
+                restore = None
+                if self.model.expressions.get(loc, "") != previous:
+                    restore = self._apply_change(f"Insert {f.name}", {loc: CellState(previous)}, record=False,
+                                                 log=f"{loc}: restored", report=False)
+                if restore is None:
+                    to_formula()
+                else:
+                    restore.add_done_callback(to_formula)
 
         fut.add_done_callback(written)
         return fut
@@ -1742,6 +1805,7 @@ class MainWindow(QMainWindow):
         sheet = PropertySheet(loc, expr, self.catalog.get(parsed[0]), self.model, self, previous=previous,
                               image_size=self._native_image_size)
         sheet.regionShown.connect(lambda payload, s=sheet: self._property_sheet_region(s, payload))
+        sheet.regionEditRequested.connect(lambda payload, s=sheet: self._property_sheet_edit_region(s, payload))
         sheet.functionRequested.connect(lambda s=sheet: self._property_sheet_function(s))
         sheet.maximizeRequested.connect(self.maximize_region)
         sheet.expressionChanged.connect(self._property_sheet_expression)
@@ -1762,6 +1826,8 @@ class MainWindow(QMainWindow):
         return writable and not editing, writable and not d.online and not editing
 
     def _property_sheet_closed(self, sheet: PropertySheet) -> None:
+        if self._param_igm is sheet:
+            self._end_param_igm(False)
         if self._param_edit is sheet:
             self._end_param_edit()
         if self.property_sheet is sheet:
@@ -1793,26 +1859,23 @@ class MainWindow(QMainWindow):
         self.run(self.device.set_cell_value(loc, value), f"Setting {loc}")
 
     def _property_sheet_region(self, sheet: PropertySheet, payload: Optional[dict]) -> None:
-        """The property sheet selected (or left) a region parameter given by numbers: it is shown
-        on the image without the grid and can be dragged there (Interactive Graphics Mode); the
-        numbers follow in the sheet."""
-        if sheet is not self.property_sheet or self._editing_location is not None:
+        """While the property sheet is open its region (given by numbers) is drawn on the image in
+        the tool's fixture — outline, scan arrows and centre cross-hair, no handles — and the grid
+        stays (ISVS live/25). Editing it needs Edit ▸ Graphic (F9)."""
+        if sheet is not self.property_sheet or self._editing_location is not None or self._param_igm is not None:
             return
         if payload is None:
             if self._param_edit is sheet:
                 self._end_param_edit()
             return
         editor = self.image.editor if self._param_edit is sheet else None
-        if editor is not None and editor.value.get("$type") == payload["graphic"]["$type"] \
-                and editor.flags == payload["flags"]:
+        if editor is not None and editor.preview and editor.value.get("$type") == payload["graphic"]["$type"]:
             editor.set_value(payload["graphic"])
             editor.set_transform(payload["transform"])
         else:
-            editor = self.image.begin_edit(payload["graphic"], payload["transform"], payload["flags"])
-            editor.changed.connect(sheet.graphic_edited)
+            self.image.begin_edit(payload["graphic"], payload["transform"], preview=True)
         self._param_edit = sheet
-        self.area.set_grid_suppressed(True)
-        hint = "drag the region or its handles" if payload["flags"].get("move") else "go offline to edit it"
+        hint = "Edit ▸ Graphic (F9) edits it" if payload["flags"].get("move") else "go offline to edit it"
         note = f" — {payload['note']}" if payload.get("note") else ""
         self.area.set_message(f"{payload['label']}: {hint}{note}")
 
@@ -1820,10 +1883,46 @@ class MainWindow(QMainWindow):
         if self._param_edit is None:
             return
         self._param_edit = None
-        if self._editing_location is None:
+        if self._editing_location is None and self._param_igm is None:
             self.image.end_edit()
-            self.area.set_grid_suppressed(False)
             self.area.set_message("")
+
+    def _property_sheet_edit_region(self, sheet: PropertySheet, payload: dict) -> None:
+        """Edit ▸ Graphic (F9) in the property sheet: Interactive Graphics Mode for its region. The
+        sheet steps aside; Return puts the new numbers into the sheet, Escape discards them, a
+        click outside the region does not end it (ISVS, survey §1.2–1.3)."""
+        if sheet is not self.property_sheet or self._editing_location is not None or self._param_igm is not None:
+            return
+        self._param_igm = sheet
+        self._param_edit = None
+        sheet.hide()
+        editor = self.image.begin_edit(payload["graphic"], payload["transform"], payload["flags"])
+        editor.statusChanged.connect(lambda e=editor: self._show_edit_status(e))
+        self.area.set_grid_suppressed(True)
+        self._show_edit_status(editor)
+        note = f" ({payload['note']})" if payload.get("note") else ""
+        self.statusBar().showMessage(f"{payload['label']}: drag the region or its handles; Return accepts, "
+                                     f"Escape cancels{note}", 10000)
+        self._update_actions()
+
+    def _show_edit_status(self, editor) -> None:
+        """ISVS's status line under the image in Interactive Graphics Mode."""
+        if editor is self.image.editor:
+            self.area.set_message(editor.status_text())
+
+    def _end_param_igm(self, accept: bool) -> None:
+        sheet = self._param_igm
+        if sheet is None:
+            return
+        value = self.image.editor.value if accept and self.image.editor is not None else None
+        self._param_igm = None
+        self.image.end_edit()
+        self.area.set_grid_suppressed(False)
+        self.area.set_message("")
+        self._update_actions()
+        if self.property_sheet is sheet:
+            sheet.end_region_edit(value)
+            sheet.show()  # draws the region again
 
     def _property_sheet_function(self, sheet: PropertySheet) -> None:
         """Property sheet Insert ▸ Function: the function goes into the parameter being typed."""
@@ -1888,18 +1987,62 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ names / values
     def set_cell_name(self) -> None:
+        """Insert Cell Name… / Edit Cell Name…: the Cell Names dialog (ISVS live/119…120)."""
         loc = self.sheet.current_location()
-        if not loc:
+        if not loc or self.model.read_only:
             return
-        current = self.model.names.get(loc, "")
-        name, ok = QInputDialog.getText(self, "Cell name", f"Symbolic name for {loc}:", text=current)
-        if not ok or not name.strip() or name.strip() == current:
+        dlg = CellNamesDialog(dict(self.model.names), current=loc,
+                              has_contents=lambda l: bool(self.model.expressions.get(l)), parent=self)
+        dlg.addCellRequested.connect(lambda: self._dialog_pick(dlg, dlg.add_location))
+        dlg.accepted.connect(lambda: self._apply_names(dlg.changes()))
+        dlg.finished.connect(lambda _r: dlg.deleteLater())
+        self.cell_names_dialog = dlg
+        dlg.open()
+
+    def _apply_names(self, changes: dict[str, str]) -> None:
+        """Writes the Cell Names dialog's changes ("" removes a name; a name in use gets a suffix
+        from the vision system, as in ISVS: myval_1). One Undo step."""
+        targets = {loc: CellState(self.model.expressions[loc], name=name) for loc, name in changes.items()
+                   if self.model.expressions.get(loc)}
+        if targets:
+            self._apply_change("Cell Names", targets, log="Cell names: " + ", ".join(
+                f"{loc} = {t.name or '(none)'}" for loc, t in targets.items()))
+
+    def edit_cell_state(self) -> None:
+        """Cell State…: Enabled / Disabled / Conditionally Enabled for the selected cells."""
+        block = self.sheet.selection_block()
+        locs = [loc for loc in ops.iter_block(block) if self.model.expressions.get(loc)] if block else []
+        if not locs or self.model.read_only or not self.device.conditions_supported:
             return
-        name = name.strip()
-        if cells.looks_like_address(name):
-            QMessageBox.warning(self, "Cell name", "A cell name must not look like a cell address.")
-            return
-        self.run(self.device.set_cell_name(loc, name), f"Naming {loc}")
+
+        async def go() -> None:
+            conds = await self.device.get_cell_conditions(locs[:1])
+            dlg = CellStateDialog(ops.block_text(block), conds.get(locs[0], ""), self)
+            dlg.selectCellRequested.connect(lambda: self._dialog_pick(dlg, dlg.set_reference))
+            dlg.accepted.connect(lambda: self._apply_cell_state(block, locs, dlg.condition()))
+            dlg.finished.connect(lambda _r: dlg.deleteLater())
+            self.cell_state_dialog = dlg
+            dlg.open()
+
+        self.run(go(), "Cell State")
+
+    def _apply_cell_state(self, block: ops.Block, locs: list[str], condition: str) -> None:
+        """A relative reference is shifted for each cell of the range like a copied reference."""
+        targets = {}
+        for loc in locs:
+            r, c = ops.rc_of(loc)
+            cond = ops.shift_condition(condition, r - block[0], c - block[1]) if "$" not in condition else condition
+            targets[loc] = CellState(self.model.expressions[loc], condition=cond)
+        state = {"": "Enabled", "0": "Disabled"}.get(condition, f"Conditionally Enabled ({condition})")
+        self._apply_change("Cell State", targets, log=f"Cell state of {ops.block_text(block)}: {state}")
+        self._state_timer.start()
+
+    def _dialog_pick(self, dlg: QDialog, done) -> None:
+        """A dialog's Add / Select Cell...: it steps aside for cell selection mode, ``done(text)``
+        gets the picked cell or range (None when cancelled)."""
+        dlg.hide()
+        self.begin_cell_selection({"kind": "dialog", "dialog": dlg, "done": done},
+                                  dest=self.sheet.current_location())
 
     # ------------------------------------------------------------------ graphic editing
     def edit_graphic(self):
@@ -1909,31 +2052,34 @@ class MainWindow(QMainWindow):
         if not loc or graphic is None:
             return None
         function = cells.function_name(self.model.expressions.get(loc, ""))
-        if function is None and str(result.get("name") or "").startswith("Edit"):
-            function = str(result["name"])  # appendix A: the Edit* function's name
 
         async def go() -> None:
-            target, editing = graphic, None
+            target, editing, fn = graphic, None, function
             try:
                 editing = await self.device.begin_edit(loc)
-                # API 3.0 devices return an "Editing<Type>" object whose data is the graphic.
+                # API 3.0: an "Editing<Type>" object whose data is the graphic and whose $type tells
+                # the Edit* function (EditingMaskedRegion's data is a CompositeRegion), plus flags.
                 if isinstance(editing, dict) and isinstance(editing.get("data"), dict) \
                         and editing["data"].get("$type") == graphic.get("$type"):
                     target = editing["data"]
+                fn = fn or editing_function(editing)
             except CogSocketError as e:
                 self.log(f"beginEdit not available ({e}); editing locally")
             self._end_param_edit()
             try:
-                self.image.begin_edit(target, flags=edit_flags(editing, result), function=function)
+                self.image.begin_edit(target, flags=edit_flags(editing, result), function=fn)
             except ValueError as e:
                 await self.device.end_edit()
                 raise DeviceError(str(e)) from e
             self._editing_location = loc
             self.area.set_grid_suppressed(True)
-            kind = "masked region" if self.image.editor.masked else graphic.get("$type")
-            extra = "; right-click for the menu" if self.image.editor.composite and not self.image.editor.polyline else ""
-            self.area.set_message(f"Interactive Graphics Mode: {kind} in {loc} — drag the shape or its handles{extra}; "
-                                  "Return accepts, Escape cancels")
+            editor = self.image.editor
+            kind = "masked region" if editor.masked else graphic.get("$type")
+            extra = "; right-click for the menu" if editor.composite and not editor.polyline else ""
+            editor.statusChanged.connect(lambda e=editor: self._show_edit_status(e))
+            self._show_edit_status(editor)
+            self.statusBar().showMessage(f"Interactive Graphics Mode: {kind} in {loc} — drag the shape or its "
+                                         f"handles{extra}; Return accepts, Escape cancels", 10000)
             self._update_actions()
 
         return self.run(go(), f"Editing graphic {loc}")

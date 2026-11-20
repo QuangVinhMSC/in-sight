@@ -3,7 +3,7 @@
 import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QPushButton
+from PySide6.QtWidgets import QDoubleSpinBox, QLineEdit, QPushButton, QSpinBox
 
 from insight_studio import cells
 from insight_studio.catalog import Catalog, FunctionInfo
@@ -161,7 +161,7 @@ def test_double_click_opens_property_sheet(job, qapp):
     win._on_cell_double_clicked(index)
     ps = win.property_sheet
     assert ps is not None and ps.isVisible()
-    assert ps.windowTitle() == "Inspection ❒Property Sheet ❒TrainPatMaxRedLine"
+    assert ps.windowTitle() == "Inspection - Property Sheet - TrainPatMaxRedLine"
     assert (ps.width(), ps.height()) == (426, 720)
     top = [ps.tree.topLevelItem(i).text(0) for i in range(ps.tree.topLevelItemCount())]
     assert top[:3] == ["Image", "Fixture", "Pattern Region"]
@@ -291,19 +291,39 @@ def test_enable_rules_grey_out_parameters(literal_job, qapp):
 
 
 def test_region_parameter_is_edited_on_the_image(literal_job, qapp):
+    """ISVS (survey §1.2–1.3): the region is drawn while the sheet is open (no handles, grid
+    stays); F9 hides the sheet and edits it; Return puts the numbers into the sheet, Escape
+    discards them."""
     win, fake, errors, ps = literal_job
+    ed = win.image.editor                                      # drawn with the Image row selected
+    assert ed is not None and ed.preview and win._param_edit is ps and not win.area._grid_suppressed
+    assert not any(h.isVisible() for h in ed.shapes[0].handles) and ed.shapes[0].crosshair.isVisible()
+    assert ps.act_maximize.isEnabled() and ps.act_graphic.isEnabled()
     region_item = ps.tree.topLevelItem(2)
     assert region_item.text(0) == "Pattern Region"
     ps.tree.setCurrentItem(region_item)
+    assert win.image.editor.preview and (win.image.editor.g["x"], win.image.editor.g["w"]) == (100, 440)
+
+    ps.act_graphic.trigger()                                   # F9: Interactive Graphics Mode
     ed = win.image.editor
-    assert ed is not None and win._param_edit is ps and win.area._grid_suppressed
-    assert (ed.g["x"], ed.g["y"], ed.g["w"], ed.g["h"]) == (100, 80, 440, 320)
-    assert ps.act_maximize.isEnabled() and ps.act_graphic.isEnabled()
-    ed.move_shape(ed.shapes[0], QPointF(10, 5))              # drag on the image -> numbers in the sheet
+    assert not ps.isVisible() and win._param_igm is ps and win.area._grid_suppressed and not ed.preview
+    assert ed.shapes[0].corners[0].isVisible() and not ed.shapes[0].crosshair.isVisible()
+    assert win.act_accept.isEnabled() and win.act_accept.shortcut().toString() == "Return"
+    assert win.area.pixel_strip.text() == "Location=100,80 Size=440×320 Rotation=0.0° Curve=0.0°"
+    ed.move_shape(ed.shapes[0], QPointF(10, 5))
+    assert win.area.pixel_strip.text() == "Location=110,85"   # while dragging: only what changes
+    assert ps.args[4:8] == ["100", "80", "440", "320"]          # nothing in the sheet before Return
+    win.act_accept.trigger()                                   # Return
+    assert ps.isVisible() and win._param_igm is None and not win.area._grid_suppressed
     assert ps.args[4:8] == ["110", "85", "440", "320"] and ps._editors[4].value() == 110
     assert region_item.text(1) == "(110,85,440,320,0,0)"
-    assert win.image.editor is ed                              # not rebuilt while dragging
+    assert win.image.editor is not None and win.image.editor.preview
     pump_until(qapp, lambda: ",110,85,440,320,0,0," in fake.expressions["G5"])
+
+    ps.act_graphic.trigger()                                   # again, then Escape: nothing changes
+    win.image.editor.move_shape(win.image.editor.shapes[0], QPointF(50, 50))
+    win.act_cancel.trigger()
+    assert ps.isVisible() and ps.args[4:8] == ["110", "85", "440", "320"]
 
     ps._editors[1].setValue(50)                                # fixture X: the region moves with it
     assert win.image.editor.root.transform().dx() == 50
@@ -312,11 +332,6 @@ def test_region_parameter_is_edited_on_the_image(literal_job, qapp):
 
     ps.act_maximize.trigger()                                  # Maximize Region (image 640x480, fixture X 50)
     assert ps.args[4:10] == ["-50", "0", "640", "480", "0", "0"]
-
-    ps.tree.setCurrentItem(ps.tree.topLevelItem(0))            # another parameter: grid back, no editor
-    assert win.image.editor is None and not win.area._grid_suppressed
-    ps.tree.setCurrentItem(ps._item_for(6))                    # a child of the region shows it too
-    assert win.image.editor is not None
     ps.reject()
     pump_until(qapp, lambda: fake.expressions["G5"] == LITERAL_EXPR)
     pump_until(qapp, lambda: win.image.editor is None and not win.area._grid_suppressed)
@@ -368,18 +383,95 @@ def test_maximize_cell_region(window, qapp):
 
 def test_edit_masked_region_cell(window, qapp):
     win, fake, errors = window
-    win._paste_cells({"C6": 'EditMaskedRegion($A$0,0,0,0,1,1,1,1,1,1,"Mask",2)'})
+    win._paste_cells({"C6": 'EditMaskedRegion($A$0,0,0,0,1,1,1,1,1,1,1,"Mask",2)'})
     pump_until(qapp, lambda: cells.editable_graphic(win.model.results.get("C6")) is not None
                and "C6" in win.model.expressions)
     win.sheet.select_location("C6")
     win.edit_graphic()
     pump_until(qapp, lambda: win.image.editor is not None)
     ed = win.image.editor
-    assert ed.masked and len(ed.shapes) == 1
+    assert ed.masked and len(ed.shapes) == 1 and ed.masks == [(10, 10, 0, 50)]  # device default: one mask
+    assert ed.flags["addRegion"] and ed.flags["bend"]                          # EditingMaskedRegion flags
     ed.add_mask(50)
     win.accept_graphic()
     pump_until(qapp, lambda: isinstance(fake.values.get("C6"), dict))
     subs = fake.values["C6"]["subregions"]
-    assert [s["add"] for s in subs] == [True, False]
-    assert subs[1]["shape"]["h"] == 160 and subs[1]["shape"]["x"] == 144.0
+    assert [s["add"] for s in subs] == [True, False, False]
+    assert subs[2]["shape"]["h"] == 50 and subs[2]["shape"]["x"] == 120.0   # ISVS: at the left end of the ROI
     assert not errors
+
+
+def test_insert_function_switches_a_value_to_an_expression(literal_job, qapp):
+    """ISVS (survey §1.8, live/44): Insert ▸ Function on a number turns its spin box into a text
+    box holding the value; fx shows pressed."""
+    win, fake, errors, ps = literal_job
+    ps.tree.setCurrentItem(ps._item_for(17))                   # Feature Threshold (spin box)
+    assert ps.act_function.isEnabled() and not ps.act_function.isChecked()
+    ps.act_function.trigger()
+    box = ps._editors[17]
+    assert isinstance(box, QLineEdit) and box.text() == "20" and ps.act_function.isChecked()
+    box.setText("Max(10,20)")
+    box.editingFinished.emit()
+    assert ps.args[17] == "Max(10,20)"
+    assert not errors
+
+
+def test_event_button_with_no_event_does_nothing(literal_job, qapp):
+    win, fake, errors, ps = literal_job
+    ps.tree.setCurrentItem(ps._item_for(18))
+    button = ps._editors[18]
+    assert isinstance(button, QPushButton) and button.text() == "Train Event"
+    before = ps.desc_text.text()
+    button.click()                                             # Train Event = 0: no message (ISVS)
+    assert ps.desc_text.text() == before and ps.args[18] == "0"
+
+
+@pytest.fixture
+def real_catalog():
+    from insight_studio.catalog import DATA
+    if not DATA.is_file():
+        pytest.skip("no function catalog (run tools/build_catalog.py)")
+    return Catalog.load()
+
+
+def _sheet_for(window, qapp, catalog, expr, loc="H7"):
+    win, fake, errors = window
+    win.catalog = catalog
+    fake.expressions[loc] = expr
+    wait(spawn(win.device.refresh_sheet()))
+    pump_until(qapp, lambda: win.model.expressions.get(loc) == expr)
+    win.open_property_sheet(loc)
+    return win.property_sheet
+
+
+def test_filter_enable_rules(window, qapp, real_catalog):
+    """ISVS (survey §4): Binarize + Auto Threshold greys Threshold, Kernel, Min/Max…; Clip enables
+    Min/Max; the rules combine Filter Type and Auto Threshold."""
+    from insight_studio.catalog import default_expression
+    ps = _sheet_for(window, qapp, real_catalog, default_expression(real_catalog.get("Filter")))
+    idx = {ps._row_for(i).label: i for i in ps._editors}
+    on = lambda label: ps._editors[idx[label]].isEnabled()  # noqa: E731
+    assert on("Auto Threshold") and not on("Threshold") and not on("Kernel Rows") and not on("Min")
+    assert isinstance(ps._editors[idx["Kernel Rows"]], QSpinBox)          # integers, as in ISVS
+    assert isinstance(ps._editors[idx["Gain"]], QDoubleSpinBox)
+    ps._editors[idx["Auto Threshold"]].setChecked(False)
+    assert on("Threshold")
+    combo = ps._editors[idx["Filter Type"]]
+    combo.setCurrentIndex(combo.findData(2))                             # Clip
+    assert on("Min") and on("Max") and not on("Threshold") and not on("Auto Threshold")
+    ps.reject()
+
+
+def test_writeimage_storage_rules_and_unknown_choice(window, qapp, real_catalog):
+    from insight_studio.catalog import default_expression
+    expr = default_expression(real_catalog.get("WriteImage")).replace(",0,0,999,", ",0,7,999,")  # resolution 7
+    ps = _sheet_for(window, qapp, real_catalog, expr)
+    idx = {ps._row_for(i).label: i for i in ps._editors}
+    on = lambda label: ps._editors[idx[label]].isEnabled()  # noqa: E731
+    assert not on("Server") and not on("Timeout") and on("File Path") and on("Enable File Cleanup")
+    res = ps._editors[idx["Image Resolution"]]
+    assert res.currentText() == "7" and res.currentData() == 7            # a value without a known label
+    storage = ps._editors[idx["Storage"]]
+    storage.setCurrentIndex(storage.findData(3))                         # TCP Server
+    assert on("Server") and on("Timeout") and not on("User Name") and not on("File Path")
+    ps.reject()

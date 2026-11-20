@@ -1,5 +1,14 @@
 # Handoff: settle phase 1–5 open points on the camera, then patch
 
+> **Status 2026-11-20 (third session):** B answered by a survey of ISVS on Windows
+> ([survey-isvs-windows.md](survey-isvs-windows.md)); the code follows it (plan §9), C's enable rules are done
+> (`tools/isvs_sheets.py`). Nothing here is left except the items in plan §8.12. Next: phase 6. The camera's
+> active job is now called `backup-before-survey.jobx` (restored by ISVS from the PC backup; an EasyBuilder job).
+>
+> **Status 2026-11-20 (second session):** A done (A.8 too — ISVS was attached during B); C done except the five
+> enable rules (need the choice values from ISVS); B blocked — ISVS's embedded editor took no input (plan §8.11).
+> Answers in plan §7 phase 5 and §8.6/8.9/8.10/8.11. Camera job restored (byte-identical to the backup).
+
 Written 2026-11-20 at the end of phase 5. Read first: `docs/isvs-spreadsheet-replica-plan.md` (§7 phase 5
 "Behaviour chosen", §8 open questions). Memory notes: *ISVS live inspection* (Xephyr/Wine recipe, camera
 backup, stale-editor pitfall) and *Running tests*.

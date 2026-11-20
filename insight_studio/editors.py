@@ -1,13 +1,19 @@
 """Interactive Graphics Mode: editors for editable graphics (EditRegion, EditCircle, …, the
 literal regions of a tool's property sheet).
 
-Drawn like ISVS 26.1 (help "Rectangle Regions Interactive Graphics Mode", live screenshot
-``live/20``): the graphic in red, magenta handles — four resizable corners, the two scan
-direction arrows labelled X and Y, the rotation handle in the middle of the bottom edge and
-the bend handle in the middle of the right edge. Dragging inside a shape moves it, dragging
-one of its sides resizes it. Polygons: click an edge to add a point, Shift+Alt+click a point
-to remove it. Composite regions have a right-click menu (Add Subregion ▸, Remove Subregion,
-Subregion Operation ▸); masked regions one with Add Mask / Delete Mask.
+Drawn like ISVS 26.1 (help "Rectangle Regions Interactive Graphics Mode", live screenshots
+``live/20``, ``live/28…39``, ``live/98…112``): the graphic in red, magenta handles — four resizable
+corners, the two scan direction arrows labelled X and Y, the rotation handle in the middle of the
+bottom edge and the bend handle in the middle of the right edge. Dragging inside a shape moves it,
+dragging one of its sides resizes it. Rotating turns a region about its centre (angles shown
+0…360, clockwise); bending keeps the region's centre and the direction of its chord (Angle +
+Curve/2 stays the same) and stops when the inner edge reaches a radius of 1 px. Polygons: a
+dashed bounding box with a rotation handle below it, right-click an edge or a point for Add Point /
+Remove Point, Shift+Alt+click a point to remove it. Composite regions have a right-click menu
+(Add Subregion ▸, Remove Subregion, Subregion Operation ▸; a new subregion is the first one at
+80 % and subtracts); masked regions one with Add Mask / Delete Mask (new masks are placed at the
+left end of the ROI). ``status_text`` is ISVS's status line under the image
+(``Location=306,78 Size=440×320 Rotation=39.0° Curve=-49.3°``; while dragging only what changes).
 
 The editor works on a copy of the graphic dict in the coordinates of the item it is placed
 under (native device coordinates, or a tool's fixture coordinates when a fixture transform is
@@ -50,23 +56,56 @@ EDITABLE_TYPES = {"Region", "Circle", "Annulus", "Line", "Point", "Polygon"} | C
 MAX_SUBREGIONS = 32  # EditCompositeRegion
 MAX_MASKS = 99  # EditMaskedRegion
 MIN_SIZE = 1.0
-MAX_CURVE = 150.0
+MAX_CURVE = 360.0  # beyond the inner-radius limit (max_curve) — a full turn
 
-# Edit flags as sent by the device (EditingRegion / Edit*Result): absent means allowed.
-FLAG_KEYS = ("move", "resize", "rotate", "bend", "addRegion", "removeRegion", "editRegion")
+
+def max_curve(w: float, h: float) -> float:
+    """ISVS stops bending when the inner edge reaches a radius of 1 px: |curve| ≤ W/(H/2 + 1) rad
+    (±156.6° for 440×320, survey 2026-11-20)."""
+    if w <= 0:
+        return 0.0
+    return min(MAX_CURVE, math.degrees(w / (max(h, 0.0) / 2 + 1)))
+
+
+def norm_angle(a: float) -> float:
+    """ISVS shows angles as 0…360 (342.253 for −17.747)."""
+    a = round(a % 360.0, 6)
+    return 0.0 if a >= 360.0 else a + 0.0
+
+# Edit flags of beginEdit's Editing object, as the IS8902CX sends them (2026-11-20); absent means allowed.
+#   EditingRegion: move resize rotate bend          EditingCircle / EditingAnnulus: move resize
+#   EditingPolygon / EditingPolyline: move movePoints addPoints removePoints scale rotate
+#   EditingCompositeRegion: move rotate addRegions removeRegions editRegions
+#   EditingMaskedRegion: move resize rotate bend addRegion removeRegion editRegion
+# They are normalised to the keys below (the plural composite names to the singular ones).
+FLAG_KEYS = ("move", "resize", "rotate", "bend", "scale", "addRegion", "removeRegion", "editRegion",
+             "addPoints", "removePoints", "movePoints")
+FLAG_ALIASES = {"size": "resize", "addRegions": "addRegion", "removeRegions": "removeRegion",
+                "editRegions": "editRegion"}
+# Editing object type -> the Edit* function that made it (masked and polyline data are CompositeRegions)
+EDITING_FUNCTIONS = {"EditingMaskedRegion": "EditMaskedRegion", "EditingPolyline": "EditPolylinePath",
+                     "EditingCompositeRegion": "EditCompositeRegion"}
 
 
 def edit_flags(*sources: Optional[dict]) -> dict:
-    """The edit flags found in the given dicts (beginEdit's Editing object, the cell result)."""
+    """The edit flags found in the given dicts (beginEdit's Editing object first)."""
     out: dict = {}
     for src in sources:
-        if isinstance(src, dict):
-            for k in FLAG_KEYS:
-                if k in src and k not in out:
-                    out[k] = bool(src[k])
-            if "size" in src and "resize" not in out and isinstance(src["size"], bool):
-                out["resize"] = src["size"]
+        if not isinstance(src, dict):
+            continue
+        for k, v in src.items():
+            key = FLAG_ALIASES.get(k, k)
+            if key in FLAG_KEYS and isinstance(v, bool) and key not in out:
+                out[key] = v
     return out
+
+
+def editing_function(editing: Optional[dict]) -> Optional[str]:
+    """The Edit* function named by an Editing object's ``$type`` (None when it does not tell)."""
+    if isinstance(editing, dict):
+        t = str(editing.get("$type") or "")
+        return EDITING_FUNCTIONS.get(t) or ("Edit" + t[len("Editing"):] if t.startswith("Editing") else None)
+    return None
 
 
 def _detach(item: QGraphicsItem) -> None:
@@ -193,6 +232,11 @@ class ScanArrow(QGraphicsItem):
 
     def paint(self, painter: QPainter, option, widget=None) -> None:
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if self.label == "+":  # centre cross-hair
+            painter.setPen(_cosmetic(EDIT_COLOR, 1))
+            painter.drawLine(QPointF(-7, 0), QPointF(7, 0))
+            painter.drawLine(QPointF(0, -7), QPointF(0, 7))
+            return
         d, o = self._dir, self._out
         n = QPointF(-d.y(), d.x())
         tip, base = d * 6, d * -3
@@ -302,6 +346,10 @@ class ShapeEditor:
         self.body.setBrush(QBrush(MASK_COLOR, Qt.BrushStyle.BDiagPattern) if self.subtract
                            else QBrush(QColor(255, 0, 0, 1)))  # (almost) invisible fill: clickable inside
         self.place_handles()
+        if self.owner.preview:
+            for h in self.handles + [getattr(self, n) for n in ("rotator", "bender") if hasattr(self, n)]:
+                h.setVisible(False)
+            self.body.setCursor(Qt.CursorShape.ArrowCursor)
 
     def place_handles(self) -> None:
         pass
@@ -348,58 +396,81 @@ class RegionShape(ShapeEditor):
         self.scan_line = QGraphicsPathItem(self.root)
         self.scan_line.setPen(_cosmetic(SCAN_LINE_COLOR, 1, Qt.PenStyle.DotLine))
         self.scan_line.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        # ISVS shows a cross-hair at the centre while the region is only shown (live/25), not in IGM
+        self.crosshair = ScanArrow(self.root, "+")
+        self.crosshair.setVisible(False)
 
     def transform(self) -> QTransform:
+        """Region coordinates -> parent, ignoring the curve (see :meth:`pt` / :meth:`local`)."""
         return graphics.region_transform(self.g)
 
-    def sag(self) -> float:
-        w, curve = self.num("w"), max(-MAX_CURVE, min(MAX_CURVE, self.num("curve")))
-        return math.tan(math.radians(curve) / 2) * w / 2
+    def pt(self, s: float, t: float) -> QPointF:
+        """The region point (s along X, t along Y) in parent coordinates, curve included."""
+        return graphics.region_point(self.g, s, t)
+
+    def local(self, p: QPointF) -> QPointF:
+        """Inverse of :meth:`pt`."""
+        return graphics.region_local(self.g, p)
 
     def place_handles(self) -> None:
-        t = self.transform()
-        w, h, s = self.num("w"), self.num("h"), self.sag()
+        w, h = self.num("w"), self.num("h")
         for hnd, (fx, fy) in zip(self.corners, self.CORNERS):
-            hnd.setPos(t.map(QPointF(fx * w, fy * h)))
+            hnd.setPos(self.pt(fx * w, fy * h))
             hnd.setVisible(self.flag("resize"))
-        self.rotator.setPos(t.map(QPointF(w / 2, h - s)))
+        self.rotator.setPos(self.pt(w / 2, h))  # middle of the bottom edge
         self.rotator.setVisible(self.flag("rotate"))
-        k = max(-1.0, min(1.0, self.num("curve") / 90.0))
-        self.bender.setPos(t.map(QPointF(w, h / 2 - k * h / 2)))
+        self.bender.setPos(self.pt(w, h / 2))  # middle of the right edge
         self.bender.setVisible(self.flag("bend"))
         show_axes = self.g.get("showXArrow", True) is not False and not self.subtract
-        top, left = t.map(QPointF(w / 2, -s)), t.map(QPointF(0, h / 2))
+        top, left = self.pt(w / 2, 0), self.pt(0, h / 2)
         self.arrow_x.setPos(top)
-        self.arrow_x.set_vectors(device_vector(self.root, top, t.map(QPointF(w / 2 + 1, -s)) - top),
-                                 device_vector(self.root, top, t.map(QPointF(w / 2, -s - 1)) - top))
+        self.arrow_x.set_vectors(device_vector(self.root, top, self.pt(w / 2 + 1, 0) - top),
+                                 device_vector(self.root, top, self.pt(w / 2, -1) - top))
         self.arrow_y.setPos(left)
-        self.arrow_y.set_vectors(device_vector(self.root, left, t.map(QPointF(0, h / 2 + 1)) - left),
-                                 device_vector(self.root, left, t.map(QPointF(-1, h / 2)) - left))
+        self.arrow_y.set_vectors(device_vector(self.root, left, self.pt(0, h / 2 + 1) - left),
+                                 device_vector(self.root, left, self.pt(-1, h / 2) - left))
+        self.crosshair.setPos(self.pt(w / 2, h / 2))
+        self.crosshair.setVisible(self.owner.preview and not self.subtract)
         self.arrow_x.setVisible(show_axes)
         self.arrow_y.setVisible(show_axes and self.g.get("showYArrow", True) is not False)
         line = QPainterPath()
-        if self.g.get("showScanLine") or self.owner.masked:
-            line.moveTo(t.map(QPointF(0, h / 2)))
-            line.lineTo(t.map(QPointF(w, h / 2)))
+        if self.g.get("showScanLine") or self.owner.masked:  # the device draws it along the centre line
+            steps = max(1, int(abs(self.num("curve")) / 3))
+            line.moveTo(self.pt(0, h / 2))
+            for i in range(1, steps + 1):
+                line.lineTo(self.pt(w * i / steps, h / 2))
         self.scan_line.setPath(line)
 
     # ------------------------------------------------------------------ edits
     def _set_rect(self, left: float, top: float, right: float, bottom: float) -> None:
-        origin = self.transform().map(QPointF(left, top))
+        """Crops/extends the region to [left, right] × [top, bottom] in region coordinates. A
+        curved region keeps its centre of curvature: the new origin is the curved point
+        (left, top), the angle turns with it and the curve shrinks with the span."""
+        w, h, curve = self.num("w"), self.num("h"), self.num("curve")
+        origin = self.pt(left, top)
+        theta = math.radians(curve)
+        if abs(theta) > 1e-9 and w > 0:
+            span = (right - left) / w
+            c = h / 2 + w / theta
+            self.g["w"] = theta * span * (c - (top + bottom) / 2)
+            self.g["curve"] = curve * span
+            self.g["angle"] = self.num("angle") + math.degrees(left * theta / w)
+        else:
+            self.g["w"] = right - left
         self.g["x"], self.g["y"] = origin.x(), origin.y()
-        self.g["w"], self.g["h"] = right - left, bottom - top
+        self.g["h"] = bottom - top
 
     def _corner(self, fx: int, fy: int, p: QPointF) -> None:
         if not self.flag("resize"):
             return
-        local = self.transform().inverted()[0].map(p)
+        local = self.local(p)
         w, h = self.num("w"), self.num("h")
         left, right = (0.0, max(MIN_SIZE, local.x())) if fx else (min(w - MIN_SIZE, local.x()), w)
         top, bottom = (0.0, max(MIN_SIZE, local.y())) if fy else (min(h - MIN_SIZE, local.y()), h)
         self.owner.resize_shape(self, lambda: self._set_rect(left, top, right, bottom))
 
     def _side(self, side: str, p: QPointF) -> None:
-        local = self.transform().inverted()[0].map(p)
+        local = self.local(p)
         w, h = self.num("w"), self.num("h")
         left, top, right, bottom = 0.0, 0.0, w, h
         if side == "left":
@@ -413,37 +484,59 @@ class RegionShape(ShapeEditor):
         self.owner.resize_shape(self, lambda: self._set_rect(left, top, right, bottom))
 
     def _rotate(self, p: QPointF) -> None:
+        """The rotation handle follows the mouse around the region's centre."""
         if not self.flag("rotate"):
             return
         w, h = self.num("w"), self.num("h")
-        c = self.transform().map(QPointF(w / 2, h / 2))
-        angle = math.degrees(math.atan2(p.y() - c.y(), p.x() - c.x())) - 90.0
-        angle = (angle + 180.0) % 360.0 - 180.0
-        self.owner.rotate_shape(self, c, angle - self.num("angle"))
+        c, hnd = self.pt(w / 2, h / 2), self.pt(w / 2, h)
+        delta = math.degrees(math.atan2(p.y() - c.y(), p.x() - c.x())
+                             - math.atan2(hnd.y() - c.y(), hnd.x() - c.x()))
+        delta = (delta + 180.0) % 360.0 - 180.0
+        if abs(delta) > 1e-9:
+            self.owner.rotate_shape(self, c, delta)
 
     def rotate_about(self, c: QPointF, delta: float) -> None:
         t = QTransform().translate(c.x(), c.y()).rotate(delta).translate(-c.x(), -c.y())
         origin = t.map(QPointF(self.num("x"), self.num("y")))
         self.g["x"], self.g["y"] = origin.x(), origin.y()
-        self.g["angle"] = round((self.num("angle") + delta + 180.0) % 360.0 - 180.0, 3)
+        self.g["angle"] = round(norm_angle(self.num("angle") + delta), 3)
 
     def _bend(self, p: QPointF) -> None:
+        """As ISVS: the region bends about its centre (the middle of the centre line stays put)
+        and its chord keeps its direction, so Angle + Curve/2 is constant; the curve is twice the
+        angle of the pointer seen from the centre against the chord (down = positive), limited
+        by :func:`max_curve`."""
         if not self.flag("bend"):
             return
-        local = self.transform().inverted()[0].map(p)
-        h = self.num("h") or 1.0
-        k = max(-1.0, min(1.0, (h / 2 - local.y()) / (h / 2)))
-        self.g["curve"] = round(k * 90.0, 1)
+        w, h = self.num("w"), self.num("h")
+        centre = self.pt(w / 2, h / 2)
+        chord = self.num("angle") + self.num("curve") / 2
+        v = QTransform().rotate(-chord).map(p - centre)
+        limit = max_curve(w, h)
+        curve = round(max(-limit, min(limit, 2 * math.degrees(math.atan2(v.y(), v.x())))), 3)
+        self.owner.op = "bend"
+        self.set_curve(curve)
         self.changed()
 
+    def set_curve(self, curve: float) -> None:
+        """Changes the curve keeping the region's centre and chord direction (ISVS)."""
+        w, h = self.num("w"), self.num("h")
+        centre = self.pt(w / 2, h / 2)
+        chord = self.num("angle") + self.num("curve") / 2
+        self.g["curve"] = curve
+        self.g["angle"] = round(norm_angle(chord - curve / 2), 3)
+        self.g["x"], self.g["y"] = 0.0, 0.0
+        off = self.pt(w / 2, h / 2)
+        self.g["x"], self.g["y"] = centre.x() - off.x(), centre.y() - off.y()
+
     def side_at(self, p: QPointF) -> Optional[str]:
-        local = self.transform().inverted()[0].map(p)
+        local = self.local(p)
         w, h, tol = self.num("w"), self.num("h"), self.tolerance()
-        if not (-tol <= local.x() <= w + tol and -tol - abs(self.sag()) <= local.y() <= h + tol):
+        if not (-tol <= local.x() <= w + tol and -tol <= local.y() <= h + tol):
             return None
         for side, dist in (("left", abs(local.x())), ("right", abs(local.x() - w)),
                            ("top", abs(local.y())), ("bottom", abs(local.y() - h))):
-            if dist <= tol and abs(self.num("curve")) < 1e-6:
+            if dist <= tol:
                 return side
         return None
 
@@ -543,11 +636,16 @@ class PointShape(ShapeEditor):
 
 
 class PolygonShape(ShapeEditor):
-    """Vertices can be dragged; clicking an edge adds a point there, Shift+Alt+click on a point
-    removes it (at least three points stay)."""
+    """Vertices can be dragged; right-click an edge or a point for Add Point / Remove Point,
+    Shift+Alt+click on a point removes it (at least three points stay). As in ISVS a plain click
+    on an edge does not add a point. A dashed bounding box with a rotation handle below its
+    middle turns the polygon about the box centre; there are no scale handles (live/108…112)."""
+
+    ROTATE_GAP_PX = 14  # the rotation handle sits this far below the box
 
     def __init__(self, *args, **kwargs) -> None:
         self._retired: list[Handle] = []
+        self._turn: Optional[tuple[QPointF, QPointF, list[QPointF]]] = None  # centre, start, points
         super().__init__(*args, **kwargs)
 
     def points(self) -> list[QPointF]:
@@ -567,17 +665,56 @@ class PolygonShape(ShapeEditor):
         for i in range(len(self.points())):
             self.handle((lambda i: lambda p: self._vertex(i, p))(i), tooltip="Shift+Alt+click removes the point",
                         on_press=(lambda i: lambda e: self._press_vertex(i, e))(i))
+        if not hasattr(self, "box"):
+            self.box = QGraphicsPathItem(self.root)
+            self.box.setPen(_cosmetic(EDIT_COLOR, 1, Qt.PenStyle.DashLine))
+            self.box.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.rotator = Handle(self.root, self._rotate, "rotate", "Rotate", Qt.CursorShape.CrossCursor,
+                              on_press=self._press_rotate)
+
+    def bounds(self) -> QRectF:
+        pts = self.points()
+        if not pts:
+            return QRectF()
+        xs, ys = [p.x() for p in pts], [p.y() for p in pts]
+        return QRectF(QPointF(min(xs), min(ys)), QPointF(max(xs), max(ys)))
 
     def place_handles(self) -> None:
         pts = self.points()
         if len(pts) != len(self.handles):
+            self._retired.append(self.rotator)
+            _detach(self.rotator)
             self.build()
         for hnd, p in zip(self.handles, pts):
             hnd.setPos(p)
+            hnd.setVisible(self.flag("movePoints") or self.flag("removePoints"))
+        r = self.bounds()
+        box = QPainterPath()
+        if not self.owner.composite:  # a polygon of its own (EditPolygon), not a subregion
+            box.addRect(r)
+        self.box.setPath(box)
+        self.rotator.setPos(QPointF(r.center().x(), r.bottom() + self.ROTATE_GAP_PX / device_scale(self.root)))
+        self.rotator.setVisible(self.flag("rotate") and not self.owner.composite)
+
+    def _press_rotate(self, event) -> bool:
+        c = self.bounds().center()
+        self._turn = (c, self.root.mapFromScene(event.scenePos()), self.points())
+        return False
+
+    def _rotate(self, p: QPointF) -> None:
+        if not self.flag("rotate") or self._turn is None:
+            return
+        c, start, pts = self._turn
+        delta = math.degrees(math.atan2(p.y() - c.y(), p.x() - c.x()) - math.atan2(start.y() - c.y(), start.x() - c.x()))
+        t = QTransform().translate(c.x(), c.y()).rotate(delta).translate(-c.x(), -c.y())
+        self.owner.op = "rotate"
+        self.set_points([t.map(q) for q in pts])
+        self.changed()
 
     def _vertex(self, i: int, p: QPointF) -> None:
         pts = self.points()
-        if i < len(pts) and self.flag("resize"):
+        if i < len(pts) and self.flag("movePoints"):
+            self.owner.op = "points"
             pts[i] = p
             self.set_points(pts)
             self.changed()
@@ -586,7 +723,7 @@ class PolygonShape(ShapeEditor):
         mods = event.modifiers()
         if mods & Qt.KeyboardModifier.ShiftModifier and mods & Qt.KeyboardModifier.AltModifier:
             pts = self.points()
-            if len(pts) > 3 and self.flag("resize"):
+            if len(pts) > 3 and self.flag("removePoints"):
                 del pts[i]
                 self.set_points(pts)
                 self.changed()
@@ -595,6 +732,35 @@ class PolygonShape(ShapeEditor):
 
     def move_by(self, d: QPointF) -> None:
         self.set_points([p + d for p in self.points()])
+
+    def vertex_at(self, p: QPointF) -> Optional[int]:
+        tol = 2 * self.tolerance()
+        for i, q in enumerate(self.points()):
+            if math.hypot(p.x() - q.x(), p.y() - q.y()) <= tol:
+                return i
+        return None
+
+    def add_point(self, p: QPointF) -> None:
+        """Add Point: on an edge at the clicked spot; on a point, in the middle of its next edge."""
+        pts = self.points()
+        v = self.vertex_at(p)
+        if v is not None:
+            a, b = pts[v], pts[(v + 1) % len(pts)]
+            pts.insert(v + 1, (a + b) / 2)
+        else:
+            i = self.edge_at(p)
+            if i is None:
+                return
+            pts.insert(i + 1, p)
+        self.set_points(pts)
+        self.changed()
+
+    def remove_point(self, i: int) -> None:
+        pts = self.points()
+        if len(pts) > 3 and 0 <= i < len(pts):
+            del pts[i]
+            self.set_points(pts)
+            self.changed()
 
     def edge_at(self, p: QPointF) -> Optional[int]:
         pts, tol = self.points(), self.tolerance()
@@ -610,21 +776,8 @@ class PolygonShape(ShapeEditor):
                 return i
         return None
 
-    def cursor_at(self, p: QPointF, modifiers) -> Qt.CursorShape:
-        if self.edge_at(p) is not None and self.flag("resize"):
-            return Qt.CursorShape.CrossCursor  # "an arrow with +": add a point
-        return super().cursor_at(p, modifiers)
-
     def press(self, p: QPointF, modifiers):
-        i = self.edge_at(p) if self.flag("resize") else None
-        if i is None:
-            return self._mover(p)
-        pts = self.points()
-        pts.insert(i + 1, p)
-        self.set_points(pts)
-        self.changed()
-        k = i + 1
-        return lambda q: self._vertex(k, q)
+        return self._mover(p)
 
 
 SHAPES: dict[str, type[ShapeEditor]] = {
@@ -635,8 +788,8 @@ SHAPES: dict[str, type[ShapeEditor]] = {
 
 # ============================================================================ masks
 class MaskItem(QGraphicsPathItem):
-    """A mask of an EditMaskedRegion: a hatched band across the ROI (main region coordinates)
-    that can be dragged along the ROI and resized by its sides."""
+    """A mask of an EditMaskedRegion: a hatched rectangle in the ROI (main region coordinates),
+    normally across its whole height, that can be dragged along the ROI and resized by its sides."""
 
     def __init__(self, owner: "GraphicEditor", index: int, parent: QGraphicsItem) -> None:
         super().__init__(parent)
@@ -648,7 +801,7 @@ class MaskItem(QGraphicsPathItem):
         self.setBrush(QBrush(MASK_COLOR, Qt.BrushStyle.BDiagPattern))
 
     def _side(self, p: QPointF) -> Optional[str]:
-        u0, wm = self.owner.masks[self.index]
+        u0, wm = self.owner.masks[self.index][:2]
         tol = EDGE_PX / device_scale(self)
         if abs(p.x() - u0) <= tol:
             return "left"
@@ -697,10 +850,13 @@ class GraphicEditor(QObject):
     EditMaskedRegion reports a CompositeRegion)."""
 
     changed = Signal(dict)
+    statusChanged = Signal()  # status_text() changed (also when a drag ends)
 
     def __init__(self, graphic: dict, parent: QGraphicsItem, transform: Optional[QTransform] = None,
-                 flags: Optional[dict] = None, function: Optional[str] = None) -> None:
+                 flags: Optional[dict] = None, function: Optional[str] = None, preview: bool = False) -> None:
         super().__init__()
+        self.op: Optional[str] = None  # what the current drag changes: move, resize, rotate, bend, points
+        self.preview = preview  # only shown (property sheet row selected, before F9): no handles
         t = graphic.get("$type")
         if t not in EDITABLE_TYPES:
             raise ValueError(f"Editing {t} graphics is not supported")
@@ -715,10 +871,14 @@ class GraphicEditor(QObject):
             self.root.setTransform(transform)
         self.shapes: list[ShapeEditor] = []
         self.active: Optional[ShapeEditor] = None
-        self.masks: list[tuple[float, float]] = []  # masked region: (offset along the ROI, width)
+        # masked region: (x offset, width, y offset, height) of each mask in ROI coordinates. The device
+        # keeps whatever is written (also masks offset in y); new masks span the ROI's height.
+        self.masks: list[tuple[float, float, float, float]] = []
         self.mask_items: list[MaskItem] = []
         self.mask_layer: Optional[QGraphicsPathItem] = None
         self._retired: list = []  # removed items stay referenced: a menu/mouse handler may still run on them
+        if preview:
+            self.flags = {k: False for k in FLAG_KEYS}
         self._build()
 
     # ------------------------------------------------------------------ construction
@@ -747,8 +907,8 @@ class GraphicEditor(QObject):
             self.masks = []
             for sub in subs[1:]:
                 m = sub.get("shape") or {}
-                start = inv.map(QPointF(_num(m, "x"), _num(m, "y"))).x()
-                self.masks.append((start, _num(m, "w")))
+                start = inv.map(QPointF(_num(m, "x"), _num(m, "y")))
+                self.masks.append((start.x(), _num(m, "w"), start.y(), _num(m, "h")))
             self._sync_masks()
         else:
             for sub in self._subregions():
@@ -796,8 +956,46 @@ class GraphicEditor(QObject):
         if self.masked:
             self._sync_masks()
         self.changed.emit(self.value)
+        self.statusChanged.emit()
+
+    def end_drag(self) -> None:
+        if self.op is not None:
+            self.op = None
+            self.statusChanged.emit()
+
+    def status_text(self) -> str:
+        """ISVS's status line under the image in Interactive Graphics Mode: ``Location=306,78
+        Size=440×320 Rotation=39.0° Curve=-49.3°`` for a region (rounded; angles 1 decimal), the
+        bounding box for other graphics; while dragging only what the drag changes."""
+        main = self.shapes[0] if self.shapes and (self.masked or not self.composite) else None
+        if isinstance(main, RegionShape):
+            g = main.g
+            loc = f"Location={round(_num(g, 'x'))},{round(_num(g, 'y'))}"
+            size = f"Size={round(_num(g, 'w'))}×{round(_num(g, 'h'))}"
+            rot = f"Rotation={_num(g, 'angle'):.1f}°"
+            curve = f"Curve={_num(g, 'curve'):.1f}°"
+            parts = {"move": [loc], "rotate": [rot], "bend": [curve],
+                     "resize": [size, curve] if abs(_num(g, "curve")) > 1e-9 else [size]}.get(self.op)
+            return " ".join(parts or [loc, size, rot, curve])
+        rect = QRectF()
+        for s in self.shapes:
+            if not s.subtract or not self.composite:
+                rect = rect.united(s.path().boundingRect())
+        if isinstance(main, PolygonShape):  # ISVS counts pixels: 180…620 is 441 wide
+            return (f"Location={math.floor(rect.left())},{math.floor(rect.top())} "
+                    f"Size={math.floor(rect.right()) - math.floor(rect.left()) + 1}×"
+                    f"{math.floor(rect.bottom()) - math.floor(rect.top()) + 1}")
+        if isinstance(main, (CircleShape, AnnulusShape)) and not self.composite:
+            g = main.g
+            radii = (f"Radius={_num(g, 'radius'):.1f}" if g.get("$type") == "Circle" else
+                     f"Inner Radius={_num(g, 'innerRadius'):.1f} Outer Radius={_num(g, 'outerRadius'):.1f}")
+            return f"Location={round(_num(g, 'x'))},{round(_num(g, 'y'))} {radii}"
+        if rect.isNull():
+            return ""
+        return f"Location={round(rect.left())},{round(rect.top())} Size={round(rect.width())}×{round(rect.height())}"
 
     def move_shape(self, shape: ShapeEditor, d: QPointF) -> None:
+        self.op = "move"
         if self.composite and not self.masked and not self.flags.get("editRegion", True):
             for s in self.shapes:  # subregions are fixed: the whole composite moves
                 s.move_by(d)
@@ -808,13 +1006,25 @@ class GraphicEditor(QObject):
         shape.changed()
 
     def resize_shape(self, shape: ShapeEditor, apply: Callable[[], None]) -> None:
+        self.op = "resize"
+        old_h = shape.num("h")
         apply()
         if self.masked:
-            w = shape.num("w")
-            self.masks = [(max(0.0, min(u, w - min(wm, w))), min(wm, w)) for u, wm in self.masks]
+            w, h = shape.num("w"), shape.num("h")
+            masks = []
+            for u, wm, v, hm in self.masks:
+                wm = min(wm, w)
+                if abs(v) < 1e-6 and abs(hm - old_h) < 1e-6:
+                    v, hm = 0.0, h  # a mask across the ROI stays across it
+                else:
+                    hm = min(hm, h)
+                    v = max(0.0, min(v, h - hm))
+                masks.append((max(0.0, min(u, w - wm)), wm, v, hm))
+            self.masks = masks
         shape.changed()
 
     def rotate_shape(self, shape: ShapeEditor, centre: QPointF, delta: float) -> None:
+        self.op = "rotate"
         if isinstance(shape, RegionShape):
             shape.rotate_about(centre, delta)
             shape.changed()
@@ -826,7 +1036,6 @@ class GraphicEditor(QObject):
     def _sync_masks(self) -> None:
         main = self.shapes[0]
         self.mask_layer.setTransform(main.transform())
-        h = main.num("h")
         while len(self.mask_items) > len(self.masks):
             item = self.mask_items.pop()
             if item.scene() is not None:
@@ -838,38 +1047,44 @@ class GraphicEditor(QObject):
         shape_tpl = {k: v for k, v in main.g.items() if k not in ("x", "y", "w", "h", "angle", "curve")}
         out = [subs[0]]
         t = main.transform()
-        for item, (u, wm) in zip(self.mask_items, self.masks):
+        for item, (u, wm, v, hm) in zip(self.mask_items, self.masks):
             p = QPainterPath()
-            p.addRect(QRectF(u, 0, wm, h))
+            p.addRect(QRectF(u, v, wm, hm))
             item.setPath(p)
-            o = t.map(QPointF(u, 0))
+            o = t.map(QPointF(u, v))
             out.append({**template, "$type": "SubRegion", "add": False,
-                        "shape": {**shape_tpl, "$type": "Region", "x": o.x(), "y": o.y(), "w": wm, "h": h,
+                        "shape": {**shape_tpl, "$type": "Region", "x": o.x(), "y": o.y(), "w": wm, "h": hm,
                                   "angle": main.num("angle"), "curve": 0.0}})
         subs[:] = out
 
     def move_mask(self, i: int, du: float) -> None:
         w = self.shapes[0].num("w")
-        u, wm = self.masks[i]
-        self.masks[i] = (max(0.0, min(w - wm, u + du)), wm)
+        u, wm, v, hm = self.masks[i]
+        self.masks[i] = (max(0.0, min(w - wm, u + du)), wm, v, hm)
         self.shape_changed()
 
     def resize_mask(self, i: int, side: str, x: float) -> None:
         w = self.shapes[0].num("w")
-        u, wm = self.masks[i]
+        u, wm, v, hm = self.masks[i]
         if side == "left":
             nu = max(0.0, min(u + wm - MIN_SIZE, x))
-            self.masks[i] = (nu, u + wm - nu)
+            self.masks[i] = (nu, u + wm - nu, v, hm)
         else:
-            self.masks[i] = (u, max(MIN_SIZE, min(w - u, x - u)))
+            self.masks[i] = (u, max(MIN_SIZE, min(w - u, x - u)), v, hm)
         self.shape_changed()
 
-    def add_mask(self, at_local_x: float) -> None:
+    def add_mask(self, at_local_x: float = 0.0) -> None:
+        """ISVS puts a new mask at the left end of the ROI, next to the masks already there — not
+        at the click (live/99). ``at_local_x`` is kept for callers; it is not used."""
         main = self.shapes[0]
         w = main.num("w")
         wm = max(MIN_SIZE, min(w, round(max(10.0, w * 0.05), 3)))
-        u = max(0.0, min(w - wm, at_local_x - wm / 2))
-        self.masks.append((u, wm))
+        u = 0.0
+        for mu, mw, _v, _h in sorted(self.masks):
+            if mu < u + wm and u < mu + mw:  # overlaps: try right after this mask
+                u = mu + mw
+        u = min(u, max(0.0, w - wm))
+        self.masks.append((u, wm, 0.0, main.num("h")))
         self.shape_changed()
 
     def delete_mask(self, i: int) -> None:
@@ -878,21 +1093,43 @@ class GraphicEditor(QObject):
             self.shape_changed()
 
     # ------------------------------------------------------------------ composite subregions
-    def add_subregion(self, kind: str, at: QPointF) -> None:
+    def _new_subregion(self, kind: str, at: QPointF) -> dict:
+        """ISVS (live/103): a new subregion is the first one at 80 % of its size, centred on it
+        (a Region keeps the first region's angle); without a first subregion, around ``at``."""
+        first = self.shapes[0] if self.shapes else None
+        if first is not None:
+            r = first.path().boundingRect()
+            c, w, h = r.center(), r.width() * 0.8, r.height() * 0.8
+        else:
+            c, w, h = at, 100.0, 80.0
+        if kind == "Region" and isinstance(first, RegionShape):
+            fw, fh = first.num("w") * 0.8, first.num("h") * 0.8
+            centre = first.pt(first.num("w") / 2, first.num("h") / 2)
+            g = {"$type": "Region", "x": 0.0, "y": 0.0, "w": fw, "h": fh, "angle": first.num("angle"), "curve": 0.0}
+            off = graphics.region_point(g, fw / 2, fh / 2)
+            g["x"], g["y"] = centre.x() - off.x(), centre.y() - off.y()
+            return g
+        x, y, r = c.x(), c.y(), min(w, h) / 2
+        return {
+            "Region": {"$type": "Region", "x": x - w / 2, "y": y - h / 2, "w": w, "h": h, "angle": 0.0, "curve": 0.0},
+            "Circle": {"$type": "Circle", "x": x, "y": y, "radius": r},
+            "Annulus": {"$type": "Annulus", "x": x, "y": y, "innerRadius": r / 2, "outerRadius": r},
+            "Polygon": {"$type": "Polygon", "points": [x, y - h / 2, x + w / 2, y + h / 2, x - w / 2, y + h / 2],
+                        "length": 3},
+        }[kind]
+
+    def add_subregion(self, kind: str, at: QPointF, add: Optional[bool] = None) -> None:
+        """Add Subregion ▸ kind. From the Interactive Graphics Mode menu the new subregion
+        subtracts (ISVS live/104); the first one of an empty composite adds."""
         if kind not in SHAPE_TYPES:
             return
-        x, y = at.x(), at.y()
-        shapes = {
-            "Region": {"$type": "Region", "x": x - 50, "y": y - 40, "w": 100.0, "h": 80.0, "angle": 0.0, "curve": 0.0},
-            "Circle": {"$type": "Circle", "x": x, "y": y, "radius": 50.0},
-            "Annulus": {"$type": "Annulus", "x": x, "y": y, "innerRadius": 30.0, "outerRadius": 60.0},
-            "Polygon": {"$type": "Polygon", "points": [x, y - 40, x + 40, y + 30, x - 40, y + 30], "length": 3},
-        }
         color = self.g.get("color")
-        shape = dict(shapes[kind])
+        shape = self._new_subregion(kind, at)
         if color is not None:
             shape["color"] = color
-        sub = {"$type": "SubRegion", "add": True, "shape": shape}
+        if add is None:
+            add = not self._subregions()
+        sub = {"$type": "SubRegion", "add": add, "shape": shape}
         if color is not None:
             sub["color"] = color
         self._subregions().append(sub)
@@ -932,9 +1169,19 @@ class GraphicEditor(QObject):
             a = menu.addAction("Add Mask", lambda: self.add_mask(local.x()))
             a.setEnabled(inside and len(self.masks) < MAX_MASKS and self.flags.get("addRegion", True))
             if mask is None:
-                mask = next((i for i, (u, wm) in enumerate(self.masks) if u <= local.x() <= u + wm), None)
+                mask = next((i for i, (u, wm, v, hm) in enumerate(self.masks)
+                             if u <= local.x() <= u + wm and v <= local.y() <= v + hm), None)
             a = menu.addAction("Delete Mask", lambda: self.delete_mask(mask))
             a.setEnabled(mask is not None and self.flags.get("removeRegion", True))
+            return menu
+        if isinstance(shape, PolygonShape) and not self.composite:
+            menu = QMenu()
+            vertex = shape.vertex_at(p)
+            on_edge = vertex is not None or shape.edge_at(p) is not None
+            a = menu.addAction("Add Point", lambda: shape.add_point(p))
+            a.setEnabled(on_edge and self.allowed("addPoints"))
+            a = menu.addAction("Remove Point", lambda: shape.remove_point(vertex))
+            a.setEnabled(vertex is not None and len(shape.points()) > 3 and self.allowed("removePoints"))
             return menu
         if not self.composite or self.polyline:
             return None
@@ -950,10 +1197,13 @@ class GraphicEditor(QObject):
             act = op.addAction(label, (lambda v: lambda: self.set_operation(shape, v))(value))
             act.setCheckable(True)
             act.setChecked(shape is not None and (not shape.subtract) == value)
-        op.setEnabled(shape is not None and self.flags.get("editRegion", True))
+        # ISVS greys the operation of the first subregion (live/102)
+        op.setEnabled(shape is not None and self.flags.get("editRegion", True) and bool(self._sub_index(shape)))
         return menu
 
     def context_menu(self, shape: Optional[ShapeEditor], screen_pos, p: QPointF, mask: Optional[int] = None) -> None:
+        if self.preview:
+            return
         menu = self.build_menu(shape, p, mask)
         if menu is not None:
             menu.exec(screen_pos)

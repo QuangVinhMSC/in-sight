@@ -2,7 +2,9 @@
 
 Status: investigation complete; **phases 1 (look & layout) and 2 (grid fidelity) done** (2026-11-19),
 **phases 3 (cell operations), 4 (functions) and 5 (property sheet fidelity) done** (2026-11-20), phases 6–8
-to do. Next: camera checks and patches in [handoff-phase5-camera.md](handoff-phase5-camera.md).
+to do. The open ISVS questions of phases 3–5 were answered by a survey of ISVS on Windows (2026-11-20,
+[survey-isvs-windows.md](survey-isvs-windows.md), screenshots `live/21…130`) and the code was corrected to
+match ([§9](#9-isvs-survey-on-windows-2026-11-20--what-changed)).
 
 Goal: make Insight Studio's spreadsheet editor match the **In-Sight Vision Suite (ISVS) 26.1
 Spreadsheet** as closely as the public SDK allows — same layout, toolbars, menus, dialogs,
@@ -19,6 +21,7 @@ ISVS (home screen, utilities, EasyBuilder) only needs to be "good enough".
 | **In-Sight HMI API** (protocol 3.x PDF) + **HMI Developers Guide** | what a client can read/write — the boundary of this plan |
 | **In-Sight Platform API** PDF | audit log, certificates, firmware, backup only — nothing for the spreadsheet |
 | **Native Mode commands** (help) | get/set values, files, jobs, events — nothing beyond the HMI API for editing |
+| **ISVS 26.1 on Windows** (survey 2026-11-20, [survey-isvs-windows.md](survey-isvs-windows.md)) | property-sheet region editing, bend/rotate maths, integer fields, default expressions, choice values and enable rules of 20 tools, masked/composite/polygon IGM menus, Script / FormatString / snippet / Cell Names / Cut-Copy-Delete-Undo semantics. Screenshots `live/21…130`, files in `~/Documents/insight-isvs-reference/survey-2026-11/` |
 | Cognex .NET HMI sample (`milk-production-line/base/SampleCode`) | confirms button press = `setCellValue(loc, "1")`, graphic edit = `beginEdit` + `setCellValue(region)` |
 | A `.jobx` file | tar archive: plaintext `Job.json` (acquisition + HMI settings) and an **obfuscated** sheet blob. Decoding the blob would be reverse engineering → not used |
 
@@ -187,7 +190,8 @@ Message box "Are you sure you wish to clear all data from the current job?" [Yes
 modal "Initializing New Job" progress box.
 
 ### 4.2 Insert – Inspection / Delete – Inspection (live)
-Title `Insert ❒Inspection` / `Delete ❒Inspection` (❒ = the sheet name glyph). Four radio buttons
+Title `Insert - Inspection` / `Delete - Inspection` (the Windows survey shows " - "; the ❒ in the Wine
+screenshots was a missing glyph — all dialog titles corrected 2026-11-20). Four radio buttons
 (see §3), OK / Cancel. 300×173.
 
 ### 4.3 Format Cells – Inspection (live `live/11`, `live/12`) — 350×400, resizable
@@ -220,7 +224,7 @@ function has one, else the name goes into the cell.
 Data needed: category per function and icons → extend `build_catalog.py` with the TOC tree;
 one-line descriptions from the MicroContent pages; icons: draw our own per category.
 
-### 4.6 Property Sheet (live `live/17…20`) — `<sheet> - Property Sheet - <Function>`, 426×720
+### 4.6 Property Sheet (live `live/17…20`, survey `live/24…97`) — `Inspection - Property Sheet - <Function>`, 426×720
 * Menu **Edit**: Graphic (F9), Maximize Region (Ctrl+Shift+M). **Insert**: Function
   (Ctrl+Shift+F), Absolute Reference (Ctrl+Shift+A), Relative Reference (Ctrl+Shift+R).
   **Help**: Property Sheet Help (F1).
@@ -238,14 +242,22 @@ one-line descriptions from the MicroContent pages; icons: draw our own per categ
   ("Reference to a cell containing an Image structure. Default = $A$0." /
   "Region of interest: {X, Y, Width, Height, Angle, Curve}.") — ISVS's short strings are not in
   any shipped file; use the help's first sentence + default/range (as now).
-* Selecting a region parameter switches the main view to image + interactive region; double-click
-  or F9 enters Interactive Graphics Mode (§4.9).
+* **Region parameters (survey):** while the sheet is open its region is drawn on the image (red outline,
+  X/Y arrows, centre cross-hair, no handles), the sheet stays and so does the grid. Only **F9** (Edit ▸
+  Graphic) edits it — a click or double-click on the row does not: the sheet hides, handles appear, the
+  status line under the image reads `Location=306,78 Size=440×320 Rotation=39.0° Curve=-49.3°` (while
+  dragging only the quantity that changes), ✓/✗ are enabled; **Enter** puts the new values into the sheet,
+  **Esc** discards them, a click outside the region does nothing. Changed rows get a "reset to original
+  value" icon (not done). The formula bar changes only on OK.
+* Insert ▸ Function / Absolute / Relative Reference are always enabled; **Function on a number row switches
+  it to expression mode** (text box with the value, `= value`, fx pressed) — no function list.
+* Train Event button with Train Event = 0: nothing happens (no message).
 * Red ⓘ/! next to OK when the function returns #ERR (tooltip = error string). OK / Cancel.
 * Opens automatically after inserting a function; Insert Function on a cell with a function
   opens the sheet instead ("Edit Function…").
 Implemented in phase 5 (`insight_studio/property_sheet.py`, see §7).
 
-### 4.7 Cell State – Inspection (help image)
+### 4.7 Cell State - Inspection (help image; survey live/121…123 — implemented, §7 phase 6)
 "Cell Range: C7", group *Cell State*: ◉ Enabled ○ Disabled ○ Conditionally Enabled
 (→ ◉ Absolute ○ Relative, Cell Reference [   ] [Select Cell…]). OK / Cancel.
 SDK ✅ (`setCellCondition`). Formula-bar indicator shows the state (`if 1`).
@@ -254,7 +266,31 @@ SDK ✅ (`setCellCondition`). Formula-bar indicator shows the state (`if 1`).
 "Comment for cell E4:" multi-line box "(press Ctrl+Enter to enter multiple lines)", Flag color
 [Red▾], OK / Cancel; 256 chars.
 
-### 4.9 Interactive Graphics Mode (live `live/20`, help igm-*)
+### 4.9 Interactive Graphics Mode (live `live/20`, `live/28…39`, `live/98…112`, help igm-*)
+Survey 2026-11-20 (implemented in `editors.py`):
+* **Rotation** turns the region about its centre; Angle grows clockwise on screen; angles are shown 0…360.
+* **Bend** keeps the region's centre and its chord direction: Angle + Curve/2 stays constant, X/Y follow
+  (checked to 3 decimals against the three ISVS samples). Down = positive. It stops when the inner edge
+  reaches a radius of 1 px: |Curve| ≤ W/(H/2+1) rad (±156.6° for 440×320). Curve ≈ 2 × the pointer's angle
+  seen from the centre against the chord (74.2° at the old corner position; our model gives 72°).
+* Dragging a corner of a curved region changes all six values.
+* **Double-click on a control cell** (Edit* graphic) enters IGM; F9 too. The property sheet comes from the
+  cell menu's "Edit Function…".
+* **EditMaskedRegion:** right-click "Add Mask" / "Delete Mask"; a new mask is a narrow full-height band at the
+  **left end** of the ROI, next to the masks already there (not at the click). Default ROI 180,275,440×50.
+  In the survey a drag on a mask did not move it (perhaps it must be selected first — not determined);
+  Insight Studio keeps mask dragging/resizing along the ROI.
+* **EditCompositeRegion:** "Add Subregion ▸ Annulus/Circle/Polygon/Region", "Remove Subregion" (greyed with
+  one subregion), "Subregion Operation ▸ Add/Subtract" (greyed for the first subregion). A subregion added in
+  IGM is the first one at 80 % size, centred on it, operation **Subtract**; the sheet's Regions tab "Add…"
+  adds with operation Add at X 740, Y 116 (not done: the Regions tab). Enter selects the whole composite
+  instead of leaving IGM; ✓ leaves (not done: Enter accepts here). 33rd subregion: not determined.
+* **EditPolygon:** magenta vertices, dashed bounding box (`Size=441×321` for 180…620 — pixels counted), a
+  rotation handle below the box, no scale handles. A click on an edge does **not** add a point: right-click
+  an edge → "Add Point" (at the click) / "Remove Point" (greyed); on a vertex both are enabled;
+  Shift+Alt+click removes a vertex.
+
+Before the survey:
 Grid hidden; graphic drawn red with: corner handles (magenta squares), X/Y scan-direction
 arrows, **bend handle (middle of the right edge), rotation handle (middle of the bottom edge)** —
 help image `RegionLegend.png` (items 3 = Bend, 4 = Rotation). Mouse cursors change per handle;
@@ -264,10 +300,17 @@ Add Subregion / Remove Subregion / change operation), **MaskedRegion** (up to 99
 Mask). Also for **literal** region arguments inside a tool (fixture-relative) — written back into
 the expression. Today only Region/Circle/Annulus/Line/Point/Polygon on Edit* cells.
 
-### 4.10 Insert Cell Name… / name box (help + live tooltip)
+### 4.10 Insert Cell Name… / name box (help + live tooltip + survey `live/119…120`)
 Name rules: starts with a letter, `[A-Za-z0-9_]`, 1–127 chars, not cell-address-like, unique
 case-insensitively (suffix `_1`). Invalid → name box outlined red and reverted. Empty + Enter
-removes the name. (The *Insert Cell Name…* dialog itself was not captured — capture it.)
+removes the name.
+Survey: the context menu item is "Insert Cell Name..." ("Edit Cell Name..." on a named cell) and opens
+**"Cell Names"**: a table *Name | Location* of **all** names of the job, buttons [Add] [Rename] [Delete]
+[Auto Name] [OK] [Cancel]. A new row for the current cell is put in edit mode with the suggestion `Result`
+(then `Result01`). Invalid names (`1abc`, `A1`) are **silently reverted**. [Add] hides the dialog for cell
+selection ("Click to insert reference E38"), Enter returns. A duplicate is accepted in the dialog but the
+cell gets `myval_1` (the device's suffix). Named cells: blue triangle bottom-right. Formulas keep cell
+references (not rewritten to names).
 
 ### 4.11 Insert Getters
 Right-click on a tool → writes the tool's Vision Data Access result table to the right
@@ -276,14 +319,35 @@ Num Images, Score, Is Unclassified). Refuses when there is no room. Data: the "V
 Access functions … automatically inserted" tables in each tool's help page → add to the catalog.
 SDK ✅ (just expressions).
 
-### 4.12 Edit Script (help) — Script function editor
+### 4.12 Edit Script (help + survey `live/113…116`) — Script function editor
+**Survey:** inserting Scripting ▸ Script opens "Inspection - Edit Script" directly (menus Script, Edit;
+"Arguments:" box, default `10`; JavaScript editor pre-filled with a template — `"use strict";`, a `Script`
+constructor with `this.total = 0`, `module.exports = Script;`, `run`, optional `save`/`load`; "Last
+Result:"; "Console Log:" with [Clear]; [Test Script] [Save] [Cancel]). After Save the cell expression is
+only **`Script(10)`**: the source is **not in the expression** — it is cell data the HMI API cannot read or
+write → Edit Script is set aside (§6); a Script cell can be shown and its arguments edited.
+
+Before the survey:
 Arguments text box, JavaScript code editor (syntax highlight, line numbers, undo/redo, find),
 Last Result pane, Console Log; menus Script (Test Script, Import Script…, Export Script…,
 Revert Changes, Close) and Edit. **Open question:** where the script source lives (cell
 expression vs. hidden cell data) — check `getCellExpression` on a Script cell. Test Script
 (running JS) can only be emulated by writing and reading back the cell.
 
-### 4.13 FormatString dialog (help) — SDK ✅ (it only builds an expression)
+### 4.13 FormatString dialog (help + survey `live/117…118`) — SDK ✅ (it only builds an expression)
+**Survey:** title "Inspection - Property Sheet - FormatString"; group "Starting/Ending" (Leading Text,
+Trailing Text, Terminators `None` / `Carriage Return (CR)` / `Line Feed (LF)` / `CR+LF`); "☐ Use Delimiter"
+with ◉ Standard [Comma▾] / ○ Other [ ]; "Arguments" table *Include Label | Label (`Label`) | Cell | Data Type
+| Decimal Places | Fixed Width | Field Width (8, greyed unless Fixed Width) | Padding (`Leading Spaces`)*,
+[Add] (cell selection; Enter returns; new row Floating Point, 3 decimals) [Delete] [Up] [Down]; "Output: N
+characters" preview; OK / Cancel. Data types: Integer, Unsigned Integer, Integer (hex), Integer (HEX),
+Integer (Octal), Floating Point, Scientific Notation, Character, String. Expression for Leading `A`, Comma,
+CR+LF, items B44 (2 decimals) and C35 (String):
+`FormatString("%s%.0s%.2f,%.0s%s%s\r\n","A","Label",$B$44,"Label",$C$35,"")` — the leading text is the first
+`%s` argument, each item is `%.0s` (its label, hidden unless Include Label) + its conversion, the delimiter
+sits between items, the trailing text is the last `%s` argument, the terminator is literal in the format.
+
+Before the survey:
 Leading/Trailing text (30), Terminators (None/LF/CR/CR+LF), Use Delimiter (Standard: Comma,
 Space, Tab, Semicolon, Underscore / Other), item list with Add (cell selection mode) / Delete /
 Move Up / Move Down, per item Label (12), Include Label, Cell, Data Type (Integer, Unsigned,
@@ -305,8 +369,11 @@ in the test job suggests a format-string form).
 * **Custom View** (help) — list with Add/Remove/↑↓, Select Cells, Select Region, X/Y/W/H,
   Size To Contents, Show Image, Show Graphics; double-click to rename. ✅ `setCustomViewList`.
 * **Snippets panel** — Cognex snippets + Custom Snippets folder; drag into grid; Import/Export
-  Snippet (.cxdx, Alt+I / Alt+E). Snippet = block of cells → ✅ via expressions. The `.cxdx`
-  format needs a sample exported from ISVS; until then use our own JSON format.
+  Snippet (.cxdx, Alt+I / Alt+E). Snippet = block of cells → ✅ via expressions. **Survey:** a `.cxdx` is
+  a tar with `version` (`2`), `range` (`B44:B47`), an **obfuscated** `snippet.json` and `snippet.json.sig`
+  (sample in `~/Documents/insight-isvs-reference/survey-2026-11/`) — like the `.jobx` sheet blob, decoding
+  it would be reverse engineering → our own JSON format only (no `.cxdx` import/export). Save dialog
+  "Export Snippet", default folder Documents ▸ In-Sight Vision Suite ▸ In-Sight ▸ Snippets.
 * **Record/Playback (Filmstrip)** — frames with name+counter, settings dialog (folder, prefix,
   index, type, watch-cell sort OK/NG), folder, name box, counter, format (bmp/jpg/png), record,
   delay (ms, 0–60000, default 200), playback buttons (first frame, next, loop, stop, first,
@@ -360,7 +427,10 @@ in the test job suggests a format-string form).
   timings**, status-bar **processing time** breakdown.
 * **Edge AI** labelling/training apps, **OCRMax Auto-Tune**, PatMax training dialogs.
 * Job Validation **configuration**, System Health details, EasyBuilder.
-* Reading the obfuscated sheet inside `.jobx` files (would be reverse engineering).
+* Reading the obfuscated sheet inside `.jobx` files and `.cxdx` snippets (would be reverse engineering).
+* **Edit Script**: the JavaScript source is not part of the cell expression (`Script(10)`), so it can neither
+  be read nor written (survey 2026-11-20).
+* **Acquisition panel** (A0's Insert Function shows it in ISVS): no acquisition API.
 
 ## 7. Implementation phases
 
@@ -396,18 +466,24 @@ needed) and one check on the camera (with the owner's OK — use a scratch job, 
    (Insert/Delete `❒Inspection`, Find - Inspection), cell selection mode in `SheetView` + `ImageSheetArea`,
    tests `tests/test_sheet_ops.py`, `tests/test_cell_ops.py`; checked on the IS8902CX (rows 590–599 of a
    scratch job: insert row, undo, cut/paste move — names, states, EditInt value and references followed).
-   Behaviour chosen (not verified against ISVS — check when ISVS is driven again):
+   Behaviour chosen (items marked *survey* checked against ISVS on 2026-11-20, the rest not verified):
    * every write goes through one serialised writer (snapshot → write → refresh) and is one Undo step;
      Undo covers expressions, names and cell states written by this client (incl. Insert/Delete,
      Paste, Clear, Replace All, a whole Property Sheet session); in-cell control values and graphic edits
-     are not undone. History is cleared when another job is loaded or on disconnect.
+     are not undone (*survey*: ISVS does not undo an EditInt spin either). History is cleared when another
+     job is loaded or on disconnect.
    * Cut works like Excel: the cells get a dashed outline and move on Paste (references to them follow,
-     references to overwritten cells become `#REF`); Escape removes the mark.
+     references to overwritten cells become `#REF`); Escape removes the mark. *Survey:* ISVS marks the cut
+     cells (marching ants) and clears them only on Paste, references follow (`B1*2` → `D1*2`), name and
+     state move along, Paste is then greyed (once only). Overwritten cells: not checked.
    * Insert/Delete rewrite references to moved cells everywhere (also `$A$1`, also cell-state
-     references); references to deleted cells become `#REF`; an Insert that would push non-empty cells
-     off row 599 / column Z is refused. Moved control cells get their value written back; cells with a
-     `dataId` and cell formats cannot move → a confirmation lists them.
-   * Copy also copies cell states (shifted like references); names are not copied.
+     references); an Insert that would push non-empty cells off row 599 / column Z is refused. Moved
+     control cells get their value written back; cells with a `dataId` and cell formats cannot move → a
+     confirmation lists them. **Corrected (*survey*):** references to *deleted* cells are left as they are —
+     no `#REF` (ISVS: C1 = `D1*2` still reads `D1*2` after column D is deleted and then uses the cell that
+     moved into D1). Deleting a row: not checked.
+   * Copy copies cell states (shifted like references) **and names** (*survey*: the copy of `Result` is
+     named `Result_1`; the device adds the suffix). Corrected 2026-11-20.
    * Clear ▸ All = Contents (the device drops name and state with the contents); Formats/Comments disabled.
    * Insert Absolute/Relative Reference on an empty cell writes the reference; while editing (formula
      bar or cell) it is inserted at the cursor; on a cell with contents it is appended in the formula bar.
@@ -437,17 +513,23 @@ needed) and one check on the camera (with the owner's OK — use a scratch job, 
    * Inserting a function with a property sheet (dialog, panel double-click or drop, picking it from the
      completion list when it is the whole cell) writes a **default expression** and opens the property
      sheet; Cancel restores the previous cell, OK is one Undo step. Defaults: template if known, image
-     `$A$0`, fixture 0, regions centred on the current image (reproduces ISVS's
-     `(180,140,440,320,0,0)` for TrainPatMaxRedLine on 800×600), help defaults incl. "(0 to 100; default
-     = 5)", choices' default, events `$A$0` (train/reset/clear events `0`), references `0`. When a
-     parameter has no known default (76 of 220 tools have a full default today; e.g. FindPatMaxRedLine's
-     Pattern, Caliper, DetectBlobs) or the device refuses it, the name goes to the formula bar as before.
+     `$A$0`, fixture 0, help defaults incl. "(0 to 100; default = 5)", choices' default, events `$A$0`
+     (train/reset/clear events `0`), references `0`. **Corrected (survey):** regions are ISVS's *fixed*
+     numbers — 440×320 (200×50 for FindLine/Caliper) centred on 800×600, also on the camera's 1920×552
+     image — not scaled to the image; the 20 sheets read in ISVS come from `tools/isvs_sheets.py`, and the
+     defaults of all 12 tools whose expressions were copied in ISVS are reproduced exactly (test
+     `test_default_expressions_are_what_isvs_writes`), incl. FindPatMaxRedLine, Caliper, DetectBlobs,
+     FindBlobs, ReadIDMax, `Button("",-1)` and the Edit* controls with Name `""` and Show `0`. When a
+     parameter has no known default or the device refuses it, the name goes to the formula bar as before.
    * "Edit Function…" / Insert Function on a function cell → property sheet only when the function has
-     one (or is unknown to the catalog); A0's `AcquireImage()` and `Abs(A1)` get the Insert Function dialog.
+     one (or is unknown to the catalog); `Abs(A1)` gets the Insert Function dialog. **Corrected (survey):**
+     on A0's `AcquireImage()` Insert Function brings up the Acquisition tab of the right dock.
+   * *Survey:* a function is listed under every category it belongs to (GetX under Blobs and CircleFit) —
+     as the catalog's `paths` already do.
 5. ✅ **Property sheet fidelity** — styling, enable rules, region selection → image mode, Maximize
    Region, literal-region interactive editing (fixture transform), Edit Graphic for all types incl.
    composite/masked regions, error mark.
-   Done: `property_sheet.py` — title `Inspection ❒Property Sheet ❒<Function>`, 426×720; menus Edit (Graphic F9,
+   Done: `property_sheet.py` — title `Inspection - Property Sheet - <Function>` (was `❒`, a Wine missing glyph), 426×720; menus Edit (Graphic F9,
    Maximize Region Ctrl+Shift+M), Insert (Function Ctrl+Shift+F, Absolute Reference Ctrl+Shift+A, Relative
    Reference Ctrl+Shift+R), Help (Property Sheet Help F1) and the toolbar $ ▦ fx graphic maximize ? (new `help`
    icon); selected row = yellow label + yellow-bordered value box, references blue, third column `= ❒Image`,
@@ -461,29 +543,69 @@ needed) and one check on the camera (with the owner's OK — use a scratch job, 
    object / result (`move`, `resize`, `rotate`, `bend`, `addRegion`, `removeRegion`, `editRegion`). Main
    window: Maximize Cell Region (toolbar, Ctrl+Shift+M) on Edit cells with a Region. Fake device: EditAnnulus,
    EditPolygon, EditCompositeRegion, EditMaskedRegion. Tests `tests/test_editors.py`, `tests/test_property_sheet.py`.
-   Behaviour chosen (check against ISVS / the camera):
-   * Selecting a region parameter given by numbers (or one of its fields) hides the grid and makes the region
-     editable on the image right away, with the sheet still open (live/20 shows it so); dragging updates the
-     fields and writes the expression (debounced); another row brings the grid back. F9 / double-click on such a
-     row just shows it again; on a reference to an Edit graphic cell they open that cell's Interactive Graphics
-     Mode as before (Return/Escape). A region with cell references is not graphical (help note).
-   * The region is drawn in the tool's fixture: Fixture X/Y/Theta as numbers or references to numeric cells;
-     otherwise it is shown in image coordinates with a note. Maximize Region = the whole image expressed in the
-     fixture (angle −Theta), curve 0; on an EditRegion cell the value becomes (0,0,W,H,0,0).
-   * Bend handle: moving it from the middle of the right edge to the top/bottom corner sets curve +90/−90°
-     (drawing of curved regions is still an approximation). Rotation turns about the region centre.
-   * Masks are read back as bands (offset along the ROI, width) and written as Regions with the ROI's height
-     and angle; a new mask is 5 % of the ROI wide (≥10) centred on the click.
-   * Integer vs. float spin boxes are guessed from the parameter name (Timeout, Number…, Index…) — ISVS gets the
-     type from the device.
-   * Event button: presses the referenced Button cell(s); with no reference (0) it explains that training while
-     the sheet is open is not available. Insert ▸ Function is enabled while a text value has focus and puts
-     `Name()` at the cursor. Restore Default moved to the row's right-click menu (not in ISVS's menus).
-   Not done: ISVS's own short parameter descriptions (§6), the ⊞/⊟ group boxes (Qt arrows), enable rules for
-   Filter / WriteData / WriteImage / ImportData / ExportData (builder warnings, phase 4).
+   Behaviour chosen — camera items **verified on the IS8902CX 2026-11-20** (scratch rows 590–599, device SVG
+   layer as reference); the ISVS UI items were checked by the Windows survey the same day (§9):
+   * **Corrected (survey):** while the sheet is open its region given by numbers (the selected one, else the
+     first) is drawn on the image without handles (centre cross-hair, scan arrows); the grid stays. F9 (Edit ▸
+     Graphic) hides the sheet and enters Interactive Graphics Mode with ISVS's status line; Return / ✓ puts the
+     numbers into the sheet (which then writes the expression), Escape / ✗ discards; a double-click on a row does
+     nothing. On a reference to an Edit graphic cell F9 opens that cell's Interactive Graphics Mode as before. A
+     region with cell references is not graphical (help note).
+   * **Verified:** the region is drawn in the tool's fixture — image = translate(X, Y) then rotate(Theta) clockwise,
+     angles add (`Region($A$0,100,50,30,20,10,200,100,15,0,2)` → origin (112.3, 68.7), edge at 45°; same with the
+     fixture as references to numeric cells). Fixtures made of anything else are shown in image coordinates with a
+     note. Maximize Region = the whole image in the fixture (angle −Theta), curve 0; on an EditRegion cell
+     (0,0,W,H,0,0) with W = image width (x): accepted, covers the 800×600 image and a loaded 1920×552 image.
+     The device keeps oversize/negative regions as written (no clamping).
+   * **Verified, drawing fixed:** a curved region is an annular sector (`graphics.curve_point`): the Y-axis edge stays
+     straight, the centre line keeps the length W, the centre of curvature is at (0, H/2 + W/θ) in region
+     coordinates, so the X-axis edge has radius H/2 + W/θ; positive curve bends towards +Y (checked for ±30, ±90,
+     120 and with angle 20 against the device's SVG). Handles sit on the curved outline (corners, rotation = middle
+     of the bottom arc, bend = middle of the right edge). Bend: the chord from the middle of the left edge to the
+     handle makes θ/2 with the X axis (keeps the handle under the mouse; dragging down = positive curve — the
+     previous mapping had the sign reversed). Cropping a curved region keeps its centre of curvature. Rotation
+     follows the mouse around the region centre. *(How ISVS's own bend/rotate handles react: unverified.)*
+   * **Verified:** masks are stored verbatim as Regions (also offset in y, shorter than the ROI, any number); the
+     device's default EditMaskedRegion is a 440×50 ROI with one 10-wide full-height mask. The editor now keeps each
+     mask's (x offset, width, y offset, height) in ROI coordinates; a new mask spans the ROI's height and is 5 % of
+     its width (≥10) centred on the click; full-height masks follow ROI height changes. On a curved ROI the device
+     keeps masks as straight Regions (the editor places them along the straight ROI axes).
+   * **Verified:** Editing object flags per type (§8.10) — the editor reads them all, and polygons use their own
+     `addPoints` / `removePoints` / `movePoints` flags.
+   * Integer vs. float spin boxes: **from the catalog** (`integer`, read in ISVS) for the 20 surveyed sheets —
+     e.g. FindLine's Accept Thresh is an integer, FindBlobs' a float; otherwise still guessed from the name.
+     Group fields can be integers or check boxes too (ReadIDMax's symbologies). A list value without a known
+     label is listed by its number.
+   * Event button: presses the referenced Button cell(s); with no reference (0) nothing happens (*survey*), the
+     tooltip explains. **Corrected (survey):** Insert ▸ Function is enabled on every row; on a spin box / check
+     box / list it switches the row to a text box with the value (fx checked), in a text box it picks a function
+     and puts `Name()` at the cursor. Restore Default is in the row's right-click menu (not in ISVS's menus).
+   * **Enable rules** (survey + help): WriteData, WriteImage, ImportData, ExportData (Storage `Local Device` = 0,
+     `FTP Server` = 1, `SFTP Server` = 2, WriteImage also `TCP Server` = 3), Filter (Filter Type × Auto
+     Threshold, per-type lists from the help), Caliper (Edge Mode), FindPatMaxRedLine, ReadIDMax. Rules can
+     combine conditions (`all` / `any` / `not`).
+   * ⊞/⊟ boxes on groups (`property_sheet.ParamTree`), as in live/18; the spin-box arrows of the property sheet are
+     now the app-wide style (`theme.STYLESHEET`).
+   Not done: ISVS's own short parameter descriptions (§6); the "reset to original value" icon on changed rows;
+   EditCompositeRegion's Regions tab and EditPolygon's Points tab; choice values ISVS was not seen to use
+   (Caliper's Edge Pair, ReadIDMax's Perspective Distortion / Symbol Damage / Sort Mode / Verification Mode,
+   WriteImage's Image Resolution, Button's events — shown by number).
 6. **Cell state, names, getters** — Cell State dialog + indicator, Insert Cell Name… dialog and
-   name-box rules, Insert Getters.
-7. **Special editors** — FormatString dialog, Edit Script dialog (after confirming storage).
+   name-box rules, Insert Getters. Layouts now known (§4.7 survey, §4.10).
+   **Partly done (2026-11-20):** `cell_dialogs.CellStateDialog` ("Cell State - Inspection", Cell Range, Enabled /
+   Disabled / Conditionally Enabled with Absolute (default) / Relative, Cell Reference + Select Cell... via cell
+   selection mode, OK greyed without a reference; a relative reference is shifted per cell of the range; one Undo
+   step), the formula-bar indicator `if 1` / `if 0` / `if <cell>` (read with `getCellCondition`, live/123), and
+   `cell_dialogs.CellNamesDialog` ("Cell Names": all names, Name | Location, Add via cell selection mode, Rename,
+   Delete, suggested `Result` / `Result01`, invalid names silently reverted, duplicates suffixed by the device;
+   "Edit Cell Name…" on a named cell). Auto Name is disabled (its behaviour was not recorded). Tests in
+   `tests/test_cell_ops.py`. Still to do: name-box rules, Insert Getters, the results tables. Also: ISVS fills a **results
+   table** after OK for tools returning a structure (bold headers in the row above starting one column to the
+   right, values in the cell's row: FindPatMaxRedLine `Index X Y Angle Scale Score`, Caliper `Index X0 Y0 X1 Y1
+   Score Contrast`, FindLine `X0 Y0 X1 Y1 Score`, ReadIDMax `Index String`, DetectBlobs/FindBlobs `Index X Y
+   Angle Color Score Area …`) — the formulas of those cells were not copied (read them next time).
+7. **Special editors** — FormatString dialog (expression form now known, §4.13). Edit Script: not possible
+   (§6).
 8. **Panels** — Filmstrip (record/playback, settings dialog), Snippets (own format, then .cxdx),
    EasyView, Custom View, Result Queue settings, Job Validation run/state, read-only Format Cells /
    Row Height / Column Width, Dependency view (F11 family).
@@ -491,25 +613,83 @@ needed) and one check on the camera (with the owner's OK — use a scratch job, 
 ## 8. Open questions to settle on the device (scratch job, with permission)
 
 1. ~~`getCellCondition` / `setCellCondition` string format~~ — answered 2026-11-20, see §1.
-2. Where Script source is stored and whether `setCellExpression` round-trips it.
-3. FormatString expression form produced by ISVS for a configured dialog.
-4. `.cxdx` snippet format (export one from ISVS).
-5. Insert Cell Name… dialog layout (not captured).
-6. `loadJobData` returns **HTTP 404 while an editor (ISVS) is attached** (seen 2026-11-19) — the app
-   should say "an editor is attached" instead of showing the raw 404. Also seen: force-killing
-   ISVS (`wineserver -k`) leaves the camera reporting `editorAttached` for a long time (>20 min);
-   closing ISVS normally (`wine taskkill /im Cognex.Explorer.exe`, no `/F`) releases it at once.
+2. ~~Where Script source is stored~~ — **answered (survey)**: not in the expression (`Script(10)`), §4.12.
+3. ~~FormatString expression form~~ — **answered (survey)**, §4.13.
+4. ~~`.cxdx` snippet format~~ — **answered (survey)**: obfuscated + signed, §4.15.
+5. ~~Insert Cell Name… dialog layout~~ — **answered (survey)**, §4.10.
+6. ~~`loadJobData` while an editor is attached~~ — **answered 2026-11-20**: HTTP 404 confirmed again with ISVS
+   attached; `InSightDevice.upload_job` now says "an editor (In-Sight Vision Suite) is attached … Close the editor
+   and try again" (fake device mimics it). Closing ISVS with `wine taskkill /im Cognex.Explorer.exe` (no `/F`)
+   released `editorAttached` within seconds, twice.
 7. ~~Whether `setCellExpression` on a range in one call exists~~ — not in the HMI API; Insert/Delete
    write cell by cell (plus one `getCellCondition` per non-empty cell). Fine for typical jobs; add a
    progress dialog if big sheets turn out slow.
-8. Check against ISVS: Cut semantics (mark vs. immediate clear), what ISVS writes for references to
-   deleted cells, whether Copy copies cell states and names, Undo scope (control values?).
-9. Phase 4 defaults: does the IS8902CX accept the default expressions (TrainPatMaxRedLine, FindLine,
-   FindBlobs, Button `$A$0`…)? What does ISVS write for a tool's structure input (Patterns, Blobs,
-   Histogram) and for parameters without a help default — capture the expression ISVS writes when
-   inserting FindPatMaxRedLine / Caliper / DetectBlobs. Does Insert Function on A0 (AcquireImage) open
-   the dialog in ISVS? Does ISVS's Functions panel list a function under each of its VDA categories?
-10. Phase 5: are the property sheet's region parameters editable on the image as soon as they are selected
-    (or only after double-click/F9)? Bend handle direction/scale and the exact curved-region geometry; rotation
-    centre; masked-region mask geometry (the API example has masks offset in y); which parameters are integers;
-    what the event button does with `0`; what the Editing object's flag names are on the IS8902CX (`beginEdit`).
+8. ~~Check against ISVS: Cut semantics, references to deleted cells, Copy of states and names, Undo
+   scope~~ — **answered (survey)**, §7 phase 3. Still open: references to overwritten cells on Cut + Paste,
+   deleting a row.
+9. Phase 4 defaults — **camera part answered 2026-11-20** (all 76 generated defaults written to rows 590–592):
+   TrainPatMaxRedLine (`❒Patterns`), FindLine (`❒Edges`), Button (`Button($A$0)`) are accepted; 13 were refused,
+   FindBlobs among them, because the help parser turned value tables into parameter groups (FindBlobs' relation
+   rows, Timer, ReadDiscrete, FormatInputBuffer, Storage…). `catalog.default_expression` now gives no default for a
+   group whose children have neither a numeric default nor choices (Fixture X/Y/Theta excepted), for references
+   other than regions, and reduces `0xFF0000 (red)` to the number → no refusals left; remaining `#ERR` are expected
+   (AutoFocus/GetFocusPosition without a liquid lens, ExtractCalibration, FindCurve on an empty image).
+   **A refused `setCellExpression` still writes the text as `'#Expr(…)`** into the cell — the insert flow now puts
+   the previous content back before handing the name to the formula bar — and the camera additionally remembers the
+   cell as "commented-out" (ISVS shows a yellow bar "The current job was loaded with commented-out cells …" listing
+   them) even after the cell is cleared. The saved job (`saveJobData`) is unaffected; the job was reloaded
+   afterwards (expected to clear it — not re-checked in ISVS).
+   ~~Still open (ISVS): the expressions ISVS writes for FindPatMaxRedLine / Caliper / DetectBlobs, Insert Function on
+   A0, VDA categories~~ — **answered (survey)**, §7 phase 4.
+10. Phase 5 — **camera part answered 2026-11-20**:
+    * `beginEdit` returns `Editing<Kind>` with `data` (the graphic), `title` (= the Name argument), `bounds`
+      (image rectangle), `fixture`, `url`, `image`, `view` and flags: EditingRegion `move resize rotate bend`;
+      EditingCircle / EditingAnnulus `move resize`; EditingPolygon and EditingPolyline (EditPolylinePath, data =
+      CompositeRegion of Regions) `move movePoints addPoints removePoints scale rotate`; EditingCompositeRegion
+      `move rotate addRegions removeRegions editRegions` (plural); EditingMaskedRegion `move resize rotate bend
+      addRegion removeRegion editRegion` (data = CompositeRegion: ROI first, masks `add: false`). Cell results are
+      `HmiButtonResult` with `caption` = the Name argument and no function name → `editors.edit_flags` normalises
+      the names, `editors.editing_function` maps the `$type` to the Edit* function (`MainWindow.edit_graphic`).
+    * EditMaskedRegion needs 13 arguments (Image, Fixture X/Y/Theta, 7 flags, Name, Show) although the help's
+      syntax line has no Theta; 12 are refused. Templates for EditPolygon / EditCompositeRegion / EditMaskedRegion /
+      EditPolylinePath added to the builder.
+    * Composite round trip (Region with angle, Circle, Annulus, Polygon, curved Region; Add/Subtract) is exact.
+      The device accepts 33 subregions — the 32 limit is ISVS's (help note), kept in the editor. Polygons round-trip;
+      `length` is recomputed from the points. A CompositeRegion written to EditPolylinePath is kept as written.
+    * Masks, fixture, curve, Maximize: see §7 phase 5. The SVG layer of `acqImageView` is the device's own drawing
+      (curved regions as SVG arcs, masks hatched, the masked region's scan line dashed yellow along the centre line).
+    * Live regression tests in `tests/test_live.py`: `test_editing_objects`, `test_refused_expression_stays_as_text`,
+      `test_curved_region_drawn_like_graphics`.
+    * ~~Still open (needs ISVS): region editing on selection, bend/rotate handles, integers, Train Event with 0,
+      Insert ▸ Function, Storage / Auto Threshold values~~ — **answered (survey)**, §4.6, §4.9, §7 phase 5.
+11. Driving ISVS on 2026-11-20 failed. The launcher took clicks, but the embedded Spreadsheet editor (a ProcHost
+    child window of another process) received no mouse or keyboard input: no popups, no cell writes, also with
+    explicit X focus. A first attempt typed `B590` into the name box and the editor then stopped painting for 5+
+    minutes (probably scrolling ~590 rows of in-cell child windows under Wine). Next attempt: run ISVS on the real
+    display `:1` (as the 2026-11-19 screenshots were taken) or with a window manager inside Xephyr, stay in the
+    top rows of a File ▸ New Job, and never jump far with the name box. §8.2–8.5, 8.8 and the ISVS parts of
+    8.9/8.10 are still open. Capture `:5` with `xwd -root` decoded as packed 24-bit BGR (row pitch 6400).
+12. Still open after the survey (next time ISVS is at hand): the commented-out-cells bar after a job reload
+    (the original job turned out to be an EasyBuilder job); whether a 33rd composite subregion is refused;
+    whether a mask can be moved/resized in y; the conditional cell state with a reference; deleting a row; the
+    tooltip of the red "!" next to OK; the formulas of the results tables ISVS adds after OK; the missing choice
+    values listed in §7 phase 5 "Not done". Note: the camera's job is now named `backup-before-survey.jobx` (same
+    content as `NewJob.jobx`, an EasyBuilder job).
+
+## 9. ISVS survey on Windows (2026-11-20) — what changed
+
+| Finding (survey §) | Change |
+| --- | --- |
+| Region parameter only drawn when selected, F9 edits, sheet hides, Enter → sheet / Esc discards (§1.2–1.3) | `PropertySheet` preview + `regionEditRequested`, `MainWindow._property_sheet_edit_region` / `_end_param_igm`; `GraphicEditor(preview=True)` (no handles, cross-hair) |
+| Status line `Location=… Size=… Rotation=… Curve=…`, only the changing part while dragging (§1.2–1.3) | `GraphicEditor.status_text`, `statusChanged`, `end_drag` (ImageView mouse release); also for cell IGM |
+| Rotation about the centre, angles 0…360 (§1.4) | `editors.norm_angle` |
+| Bend keeps centre and chord, clamp at 1 px inner radius (§1.5) | `RegionShape._bend` / `set_curve`, `editors.max_curve` (test against the ISVS samples) |
+| Train Event with 0 does nothing; Insert ▸ Function = expression mode (§1.7–1.8) | `PropertySheet._event_clicked`, `_insert_function`, `_expr_mode` |
+| Integer fields, defaults, choice values, enable rules of 20 sheets (§2–§4) | `tools/isvs_sheets.py` (SHEETS, PATCHES, ENABLE, ISVS_DEFAULTS) → `build_catalog.apply_sheets`; `is_integer_parameter` reads `integer`; compound rules in `PropertySheet._rule_holds` |
+| Fixed default regions; Name `""`, Show 0; `Button("",-1)` (§3) | `catalog._region_args`, `default_expression` ignores the image size; builder TEMPLATES |
+| A0 Insert Function → Acquisition tab (§3) | `MainWindow.insert_function` |
+| Masks at the left end; subregions at 80 %, Subtract; first subregion's operation greyed; polygon right-click Add/Remove Point, rotate handle, no click-to-add (§5) | `GraphicEditor.add_mask`, `_new_subregion`, `build_menu`; `PolygonShape` |
+| Cell Names / Cell State dialogs, `if 0` indicator (§6.4–6.5) | `cell_dialogs.CellNamesDialog`, `CellStateDialog`; `MainWindow.set_cell_name`, `edit_cell_state`, `_update_state_indicator` |
+| Dialog titles use " - " (`Delete - Inspection`, `Inspection - Property Sheet - …`); the ❒ in the Wine screenshots was a missing glyph | `cell_dialogs`, `functions_ui`, `property_sheet` titles |
+| Copy copies names (suffix by the device); Delete leaves references to deleted cells (§6.5) | `SheetView.copy_selection`/`paste`, `MainWindow._on_paste`; `sheet_ops.rewrite_references(keep_removed=)` for Delete |
+| Script source not in the expression; `.cxdx` obfuscated (§6.1, §6.3) | §6 set aside |

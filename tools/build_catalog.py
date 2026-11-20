@@ -28,6 +28,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from insight_studio.catalog import editor_versions  # noqa: E402
 from insight_studio.helpdoc import function_tables, parse_html, parse_inputs  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import isvs_sheets  # noqa: E402
+
 DEFAULT_EDITOR = Path(
     "C:/Program Files/Cognex/In-Sight/In-Sight Vision Suite Editors/In-Sight/In-Sight 26.1.0"
 )
@@ -48,6 +51,13 @@ TEMPLATES = {
     "EditAnnulus": 'EditAnnulus($A$0,0,0,0,1,1,"Annulus",2)',
     "EditLine": 'EditLine($A$0,0,0,0,1,1,"Line",2)',
     "EditPoint": 'EditPoint($A$0,0,0,0,1,"Point",2)',
+    # what ISVS 26.1 writes (survey 2026-11-20): empty Name, Show = 0; EditMaskedRegion needs Theta
+    # although its help syntax omits it
+    "EditPolygon": isvs_sheets.ISVS_DEFAULTS["EditPolygon"],
+    "EditCompositeRegion": isvs_sheets.ISVS_DEFAULTS["EditCompositeRegion"],
+    "EditMaskedRegion": isvs_sheets.ISVS_DEFAULTS["EditMaskedRegion"],
+    "EditPolylinePath": isvs_sheets.ISVS_DEFAULTS["EditPolylinePath"],
+    "Button": isvs_sheets.ISVS_DEFAULTS["Button"],
     "Now": "Now($A$0)",
 }
 
@@ -72,21 +82,12 @@ DEVICE_SPECIFIC = {"Advanced AI", "Focus"}
 
 # Parameters that are greyed out in the property sheet unless another parameter has one of the
 # given values (from the "Note: ... to enable this parameter" sentences of the help; the
-# controlling parameter's choices are given by label and resolved to values below).
+# controlling parameter's choices are given by label and resolved to values below). Rules read
+# in ISVS itself (with the device's choice values) are in isvs_sheets.ENABLE and win.
 ENABLE_RULES: dict[str, dict[str, tuple[str, list[str]]]] = {
-    "TrainPatMaxRedLine": {
-        "Coarse Granularity": ("Auto Select Coarse", ["OFF"]),
-        "Fine Granularity": ("Auto Select Fine", ["OFF"]),
-    },
-    "Filter": {"Threshold": ("Auto Threshold", ["OFF"])},
     "ValidateIDData": {"DoD UID Construct": ("Validation Options", ["DoD UID"])},
-    "WriteData": {p: ("Storage", ["FTP Server", "SFTP Server"]) for p in ("Server", "User Name", "Password")},
-    "WriteImage": {"Server": ("Storage", ["FTP Server", "SFTP Server", "TCP Server"]),
-                   "User Name": ("Storage", ["FTP Server", "SFTP Server"]),
-                   "Password": ("Storage", ["FTP Server", "SFTP Server"])},
-    "ImportData": {p: ("Storage", ["FTP/SFTP Server"]) for p in ("Host Name", "User Name", "Password")},
-    "ExportData": {p: ("Storage", ["FTP/SFTP Server"]) for p in ("Host Name", "User Name", "Password")},
 }
+
 
 _SYNTAX_RE = re.compile(r'<span class="pre">((?:(?!<span class="pre">|</p>).)*?)</span>\s*</p>', re.S)
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -317,6 +318,53 @@ class Builder:
                     and parse_inputs(page.text, keep_description=False)):
                 self.add_function_page(tf, page)
 
+    def apply_sheets(self) -> None:
+        """Parameter lists read in ISVS replace or correct the parsed ones (isvs_sheets)."""
+        for fname, params in isvs_sheets.SHEETS.items():
+            e = self.functions.get(fname.lower())
+            if e is None:
+                print(f"warning: ISVS sheet for unknown function {fname}", file=sys.stderr)
+                continue
+            parsed = {p["name"].lower(): p for p in e.get("inputs") or []}
+            out = []
+            for p in params:
+                if "keep" in p:  # the parsed parameter of that name
+                    name = p["keep"]
+                    p = parsed.get(name.lower())
+                    if p is None:
+                        raise SystemExit(f"{fname}: no parsed parameter {name}")
+                out.append(p)
+            e["inputs"] = out
+        for fname, patches in isvs_sheets.PATCHES.items():
+            e = self.functions.get(fname.lower())
+            if not e or not e.get("inputs"):
+                print(f"warning: ISVS patches for {fname}: no parameter list", file=sys.stderr)
+                continue
+            for addr, fields in patches.items():
+                target = None
+                parts = addr.split("/")
+                level = e["inputs"]
+                for part in parts:
+                    target = next((p for p in level if p["name"].lower() == part.lower()), None)
+                    if target is None:
+                        break
+                    level = target.get("children") or []
+                if target is None:
+                    print(f"warning: ISVS patch {fname}.{addr}: parameter not found", file=sys.stderr)
+                    continue
+                if "name" in fields and "kind" in fields:  # a whole parameter
+                    target.clear()
+                target.update(fields)
+        for fname, rules in isvs_sheets.ENABLE.items():
+            e = self.functions.get(fname.lower())
+            names = {p["name"].lower() for p in _leaves(e.get("inputs") or [])} if e else set()
+            for target, rule in rules.items():
+                for param in [target] + list(_rule_params(rule)):
+                    if param.lower() not in names:
+                        print(f"warning: ISVS enable rule {fname}.{target}: no parameter {param}", file=sys.stderr)
+            if e:
+                e["enable"] = rules
+
     def apply_enable_rules(self) -> None:
         for fname, rules in ENABLE_RULES.items():
             e = self.functions.get(fname.lower())
@@ -340,6 +388,13 @@ class Builder:
                     out[params[target.lower()]["name"]] = {"param": ctrl["name"], "values": values}
             if out:
                 e["enable"] = out
+
+
+def _rule_params(rule: dict):
+    if "param" in rule:
+        yield rule["param"]
+    for sub in rule.get("all", []) + rule.get("any", []):
+        yield from _rule_params(sub)
 
 
 def _leaves(params: list[dict]):
@@ -369,6 +424,7 @@ def main() -> int:
     categories = b.walk(toolbox, entries, [])
     b.scan_remaining(content)
     b.apply_enable_rules()
+    b.apply_sheets()
     for name, template in TEMPLATES.items():
         e = b.functions.get(name.lower()) or b.entry(name, None, "")
         e["template"] = template

@@ -36,7 +36,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import cells
 from .catalog import Catalog, Category, FunctionInfo, describe_category, describe_function
 from .icons import category_icon
 
@@ -238,7 +237,7 @@ class InsertFunctionDialog(QDialog):
         self.setObjectName("insertFunctionDialog")
         self.catalog = catalog
         self.target = target
-        self.setWindowTitle(f"Insert Function {cells.STRUCTURE_GLYPH}{SHEET_NAME}")
+        self.setWindowTitle(f"Insert Function - {SHEET_NAME}")
         self.resize(674, 432)
         self._path: tuple[str, ...] = ()
 

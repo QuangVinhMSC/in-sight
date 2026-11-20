@@ -327,14 +327,19 @@ class ImageView(QGraphicsView):
 
     # ------------------------------------------------------------------ editing
     def begin_edit(self, graphic: dict, transform: Optional[QTransform] = None, flags: Optional[dict] = None,
-                   function: Optional[str] = None) -> GraphicEditor:
+                   function: Optional[str] = None, preview: bool = False) -> GraphicEditor:
         """Interactive Graphics Mode for ``graphic`` (native coordinates, or the coordinates of a
-        fixture: ``transform`` maps them to native ones)."""
+        fixture: ``transform`` maps them to native ones). ``preview``: only drawn (no handles)."""
         self.end_edit()
-        self.editor = GraphicEditor(graphic, self._overlay, transform, flags, function)
+        self.editor = GraphicEditor(graphic, self._overlay, transform, flags, function, preview=preview)
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
         self.editor.refresh()
         return self.editor
+
+    def mouseReleaseEvent(self, event) -> None:
+        super().mouseReleaseEvent(event)
+        if self.editor is not None:
+            self.editor.end_drag()
 
     def contextMenuEvent(self, event) -> None:
         super().contextMenuEvent(event)

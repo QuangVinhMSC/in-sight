@@ -106,6 +106,14 @@ QTableView#sheet QTableCornerButton::section {{ background: {HEADER}; border: 0;
 #onlineBox {{ background: #d3d3d3; color: #000000; padding: 0 4px; min-width: 120px; }}
 #onlineBox[online="true"] {{ background: #4caf50; color: #ffffff; }}
 #placeholder {{ color: {TEXT_DIM}; padding: 12px; }}
+QAbstractSpinBox::up-button, QAbstractSpinBox::down-button {{ width: 13px; border-left: 1px solid #6e6e6e;
+    background: #4a4a4a; }}
+QAbstractSpinBox::up-arrow {{ border-left: 3px solid none; border-right: 3px solid none;
+    border-bottom: 4px solid {TEXT}; width: 0; height: 0; }}
+QAbstractSpinBox::down-arrow {{ border-left: 3px solid none; border-right: 3px solid none;
+    border-top: 4px solid {TEXT}; width: 0; height: 0; }}
+QAbstractSpinBox::up-arrow:disabled, QAbstractSpinBox::down-arrow:disabled {{
+    border-top-color: {TEXT_DISABLED}; border-bottom-color: {TEXT_DISABLED}; }}
 """
 
 

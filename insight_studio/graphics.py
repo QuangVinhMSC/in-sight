@@ -62,7 +62,7 @@ def shape_path(g: dict) -> Optional[QPainterPath]:
         rect = QPainterPath()
         curve = _f(g, "curve")
         if t == "Region" and abs(curve) > 1e-3 and w > 0:
-            # Curved region: the edges parallel to X become arcs of the given angular deviation.
+            # Curved region: an annular sector (see curve_point).
             rect = _curved_region(w, h, curve)
         else:
             rect.addRect(QRectF(0, 0, w, h))
@@ -137,26 +137,61 @@ def shape_path(g: dict) -> Optional[QPainterPath]:
     return None
 
 
+def curve_point(w: float, h: float, curve: float, s: float, t: float) -> QPointF:
+    """Region coordinates (``s`` along X, ``t`` along Y, before ``region_transform``) of a point of
+    a curved region, as the IS8902CX draws it (SVG layer, 2026-11-20): an annular sector whose
+    left edge (the Y axis) stays straight, whose centre line keeps the length ``w`` and whose right
+    edge is turned by ``curve`` degrees; a positive curve bends towards +Y. Its centre is at
+    (0, h/2 + w/θ), so the X-axis edge has radius h/2 + w/θ and the opposite edge w/θ − h/2."""
+    theta = math.radians(curve)
+    if abs(theta) < 1e-9 or w <= 0:
+        return QPointF(s, t)
+    c = h / 2 + w / theta
+    phi = s * theta / w
+    rho = c - t
+    return QPointF(rho * math.sin(phi), c - rho * math.cos(phi))
+
+
+def curve_local(w: float, h: float, curve: float, p: QPointF) -> QPointF:
+    """Inverse of :func:`curve_point`: (s, t) of the region point ``p`` (region coordinates)."""
+    theta = math.radians(curve)
+    if abs(theta) < 1e-9 or w <= 0:
+        return QPointF(p)
+    c = h / 2 + w / theta
+    vx, vy = p.x(), p.y() - c
+    r = math.hypot(vx, vy)
+    if theta > 0:
+        phi, rho = math.atan2(vx, -vy), r
+    else:
+        phi, rho = math.atan2(-vx, vy), -r
+    return QPointF(phi * w / theta, c - rho)
+
+
+def region_point(g: dict, s: float, t: float) -> QPointF:
+    """Image (native) coordinates of the region point (s, t), curve included."""
+    p = curve_point(_f(g, "w"), _f(g, "h"), _f(g, "curve"), s, t)
+    return region_transform(g).map(p)
+
+
+def region_local(g: dict, p: QPointF) -> QPointF:
+    """Region coordinates (s, t) of the image (native) point ``p``, curve included."""
+    q = region_transform(g).inverted()[0].map(p)
+    return curve_local(_f(g, "w"), _f(g, "h"), _f(g, "curve"), q)
+
+
 def _curved_region(w: float, h: float, curve: float) -> QPainterPath:
     path = QPainterPath()
-    # Approximate: bend the top and bottom edges by 'curve' degrees around the region centre.
-    steps = 24
-    sag = math.tan(math.radians(curve) / 2) * w / 2
-    def edge(y: float) -> list[QPointF]:
-        pts = []
-        for i in range(steps + 1):
-            u = i / steps
-            x = u * w
-            dy = sag * (1 - (2 * u - 1) ** 2)
-            pts.append(QPointF(x, y - dy))
-        return pts
-    top, bottom = edge(0), edge(h)
+    steps = max(8, int(abs(curve) / 3) + 1)
+
+    def edge(t: float, forward: bool) -> list[QPointF]:
+        rng = range(steps + 1) if forward else range(steps, -1, -1)
+        return [curve_point(w, h, curve, w * i / steps, t) for i in rng]
+
+    top, bottom = edge(0.0, True), edge(h, False)
     path.moveTo(top[0])
-    for p in top[1:]:
+    for p in top[1:] + bottom:  # top arc, right (radial) edge, bottom arc back
         path.lineTo(p)
-    for p in reversed(bottom):
-        path.lineTo(p)
-    path.closeSubpath()
+    path.closeSubpath()  # left edge: straight, along the Y axis
     return path
 
 

@@ -214,7 +214,7 @@ def test_context_menu_matches_isvs(window, qapp):
     # an empty cell (ISVS live/07): no paste without clipboard, no name, graphic or comment
     assert not _find(menu, "Paste").isEnabled()
     assert _find(menu, "Insert Function…").isEnabled()
-    for text in ("Insert Cell Name…", "Cell Graphic…", "Insert Comment…", "Formats", "Protect Cells"):
+    for text in ("Insert Cell Name…", "Cell Graphic…", "Cell State…", "Insert Comment…", "Formats", "Protect Cells"):
         assert not _find(menu, text).isEnabled(), text
     assert "HMI API" in _find(menu, "Insert Comment…").toolTip()
     assert "Not implemented" in _find(menu, "Insert Getters").toolTip()
@@ -233,7 +233,7 @@ def test_context_menu_matches_isvs(window, qapp):
         win._update_actions()
         menu = win.build_cell_menu()
         assert _find(menu, "Edit Function…") is None and _find(menu, "Insert Function…") is not None
-    assert _find(menu, "Insert Cell Name…").isEnabled()
+    assert _find(menu, "Edit Cell Name…").isEnabled()         # A0 is named "Image" (ISVS: Edit Cell Name...)
     win._paste_cells({"D4": "'x"})
     pump_until(qapp, lambda: win.model.expressions.get("D4") == "'x" and not win.model.pending)
     win.sheet.select_location("D4")

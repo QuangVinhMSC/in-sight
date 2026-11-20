@@ -1,5 +1,5 @@
 """Property sheet for a spreadsheet tool cell, laid out like the one in In-Sight Vision Suite 26.1
-(``Inspection ❒Property Sheet ❒TrainPatMaxRedLine``, live screenshots ``live/17…20``).
+(``Inspection - Property Sheet - TrainPatMaxRedLine``, live screenshots ``live/17…20``, ``live/24…97``).
 
 One row per parameter of the function (names, groups, defaults, ranges and choices come from
 the In-Sight help, see :mod:`helpdoc`): a label, the value (text box with references in blue,
@@ -10,12 +10,15 @@ control itself and changes the linked cell's value; a Button can be pressed (e.g
 button of a TrainPatMaxRedLine), and an Edit graphic can be edited on the image.
 
 Parameters that only apply when another one has a certain value are greyed out (catalog
-``enable`` rules). Selecting a region parameter given by numbers shows the region on the image
-(in the tool's fixture) and it can be dragged there; Maximize Region stretches it over the
-image.
+``enable`` rules). While the sheet is open its region (the selected region parameter, else the
+first one) is drawn on the image in the tool's fixture, with scan arrows and a centre cross-hair
+but no handles; Edit ▸ Graphic (F9) hides the sheet and edits it in Interactive Graphics Mode —
+Return puts the new numbers into the sheet, Escape discards them (ISVS, survey 2026-11-20).
+Maximize Region stretches it over the image.
 
-As in ISVS, edits are applied to the job while the sheet is open, OK keeps them and Cancel
-restores the expression and the linked values that were changed.
+Edits are applied to the job while the sheet is open (so results and the error mark follow), OK
+keeps them and Cancel restores the expression and the linked values that were changed. (ISVS's
+formula bar shows the new expression only after OK.)
 """
 
 from __future__ import annotations
@@ -25,8 +28,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from PySide6.QtCore import QPointF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QBrush, QColor, QFont, QKeySequence, QTransform
+from PySide6.QtCore import QPointF, QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QBrush, QColor, QFont, QKeySequence, QPainter, QPen, QTransform
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
@@ -59,6 +62,7 @@ from .editors import EDITABLE_TYPES
 from .helpdoc import leaf_count, parse_inputs_file
 
 REFERENCE_COLOR = "#5aa0ff"
+_UNSET = object()  # no regionShown sent yet: the next one is sent even if it is None
 LABEL_SELECTED = theme.ACCENT
 
 # ---------------------------------------------------------------------------- expressions
@@ -155,8 +159,9 @@ def _fmt(v: float, decimals: int) -> str:
     return text if text not in ("-0", "") else "0"
 
 
-# Whole-number parameters (ISVS shows them without decimals: Timeout 0, Number to Sort 6) — the
-# help does not say which numbers are integers, so it is guessed from the name/description.
+# Whole-number parameters (ISVS shows them without decimals: Timeout 0, Number to Sort 6). The
+# catalog says so for the sheets read in ISVS (``integer``); otherwise it is guessed from the
+# name/description (the help does not tell).
 _INTEGER_NAME = re.compile(r"\b(timeout|number|count|index|num|sort|results|max(imum)? (results|count|number)|"
                            r"length|size|bit|port|id)\b", re.I)
 
@@ -165,6 +170,8 @@ def is_integer_parameter(param: Optional[dict], description: str = "") -> bool:
     p = param or {}
     if p.get("kind") in ("bool", "enum"):
         return True
+    if "integer" in p:
+        return bool(p["integer"])
     name = p.get("name", "")
     return bool(_INTEGER_NAME.search(name)) or "integer" in description.lower() or \
         description.lower().startswith("number of")
@@ -300,15 +307,30 @@ QTreeWidget QLineEdit, QTreeWidget QAbstractSpinBox, QTreeWidget QComboBox {{ ba
 QTreeWidget *[current="true"] {{ border: 1px solid {LABEL_SELECTED}; }}
 QTreeWidget QLineEdit[reference="true"] {{ color: {REFERENCE_COLOR}; }}
 QTreeWidget QPushButton {{ padding: 1px 6px; }}
-QTreeWidget QAbstractSpinBox::up-button, QTreeWidget QAbstractSpinBox::down-button {{ width: 13px;
-    border-left: 1px solid #6e6e6e; background: #4a4a4a; }}
-QTreeWidget QAbstractSpinBox::up-arrow {{ border-left: 3px solid none; border-right: 3px solid none;
-    border-bottom: 4px solid {theme.TEXT}; width: 0; height: 0; }}
-QTreeWidget QAbstractSpinBox::down-arrow {{ border-left: 3px solid none; border-right: 3px solid none;
-    border-top: 4px solid {theme.TEXT}; width: 0; height: 0; }}
-QTreeWidget QAbstractSpinBox::up-arrow:disabled, QTreeWidget QAbstractSpinBox::down-arrow:disabled {{
-    border-top-color: {theme.TEXT_DISABLED}; border-bottom-color: {theme.TEXT_DISABLED}; }}
 """
+
+
+class ParamTree(QTreeWidget):
+    """The parameter tree: groups get ISVS's ⊞/⊟ boxes (live/18) instead of the style's arrows."""
+
+    BOX = 9
+
+    def drawBranches(self, painter: QPainter, rect: QRect, index) -> None:  # noqa: N802 - Qt override
+        if not self.model().hasChildren(index):
+            return
+        b = self.BOX
+        x = rect.right() - self.indentation() + (self.indentation() - b) // 2
+        y = rect.top() + (rect.height() - b) // 2
+        painter.save()
+        painter.setPen(QPen(QColor(40, 40, 40)))
+        painter.setBrush(QColor(235, 235, 235))
+        painter.drawRect(QRect(x, y, b - 1, b - 1))  # covers x … x+b-1 with the 1 px pen
+        painter.setPen(QPen(QColor(0, 0, 0), 1))
+        c = b // 2
+        painter.drawLine(x + 2, y + c, x + b - 3, y + c)  # minus
+        if not self.isExpanded(index):
+            painter.drawLine(x + c, y + 2, x + c, y + b - 3)  # plus
+        painter.restore()
 
 
 class PropertySheet(QDialog):
@@ -318,7 +340,8 @@ class PropertySheet(QDialog):
     pickStarted = Signal(str)  # "abs" / "rel": pick a cell reference in cell selection mode
     helpRequested = Signal()
     functionRequested = Signal()  # Insert ▸ Function: the caller picks one and calls insert_text
-    regionShown = Signal(object)  # dict(graphic, transform, flags, label) or None: show/edit on the image
+    regionShown = Signal(object)  # dict(graphic, transform, flags, label) or None: drawn on the image
+    regionEditRequested = Signal(object)  # F9 on a region given by numbers: the same dict, editable
     maximizeRequested = Signal(str)  # Maximize Region on a referenced EditRegion cell
 
     WRITE_DELAY_MS = 350
@@ -348,12 +371,15 @@ class PropertySheet(QDialog):
         self._links: dict[int, tuple[QWidget, Optional[str]]] = {}
         self._group_items: list[tuple[QTreeWidgetItem, ParamRow]] = []
         self._disabled: set[int] = set()  # argument indexes greyed out by an enable rule
-        self._shown_region: Optional[tuple] = None  # last regionShown payload (to skip repeats)
+        self._shown_region: Any = _UNSET  # key of the last regionShown payload (to skip repeats)
+        self._expr_mode: set[int] = set()  # arguments switched to a text box by Insert ▸ Function
+        self._igm_spec: Optional[RegionSpec] = None  # the region being edited after F9
         self._descriptions = self._load_descriptions()
         self._write_timer = QTimer(self, singleShot=True, interval=self.WRITE_DELAY_MS)
         self._write_timer.timeout.connect(self._write_now)
 
-        self.setWindowTitle(f"{SHEET_NAME} {cells.STRUCTURE_GLYPH}Property Sheet {cells.STRUCTURE_GLYPH}{self.name}")
+        # "Inspection - Property Sheet - TrainPatMaxRedLine" (ISVS on Windows; under Wine the separator showed as ❒)
+        self.setWindowTitle(f"{SHEET_NAME} - Property Sheet - {self.name}")
         self.setModal(False)
         self.resize(426, 720)
         self._build_ui()
@@ -375,8 +401,9 @@ class PropertySheet(QDialog):
         # menus and toolbar as in ISVS (live/19): Edit, Insert, Help
         self.act_graphic = self._action("Graphic", self._edit_current_graphic, "F9", "edit_graphic", "Edit Graphic")
         self.act_maximize = self._action("Maximize Region", self._maximize, "Ctrl+Shift+M", "maximize_region")
-        self.act_function = self._action("Function", self.functionRequested.emit, "Ctrl+Shift+F", "insert_function",
+        self.act_function = self._action("Function", self._insert_function, "Ctrl+Shift+F", "insert_function",
                                          "Insert Function")
+        self.act_function.setCheckable(True)
         self.act_abs = self._action("Absolute Reference", lambda: self._start_pick("abs"), "Ctrl+Shift+A", "abs_ref",
                                     "Insert Absolute Reference")
         self.act_rel = self._action("Relative Reference", lambda: self._start_pick("rel"), "Ctrl+Shift+R", "rel_ref",
@@ -400,7 +427,7 @@ class PropertySheet(QDialog):
         for a in (self.act_abs, self.act_rel, self.act_function, self.act_graphic, self.act_maximize, self.act_help):
             tb.addAction(a)
 
-        self.tree = QTreeWidget()
+        self.tree = ParamTree()
         self.tree.setObjectName("propertyTree")
         self.tree.setColumnCount(3)
         self.tree.setHeaderHidden(True)
@@ -419,7 +446,7 @@ class PropertySheet(QDialog):
         self.tree.setColumnWidth(0, 112)
         self.tree.setColumnWidth(1, 165)
         self.tree.currentItemChanged.connect(lambda cur, _prev: self._select(cur))
-        self.tree.itemDoubleClicked.connect(lambda _it, _col: self._edit_current_graphic())
+        # (ISVS: a double-click on a row does not start editing the region — F9 does)
 
         self.desc_title = QLabel()
         f = QFont(self.desc_title.font())
@@ -547,24 +574,34 @@ class PropertySheet(QDialog):
             w.setToolTip(self._event_tooltip(i))
             w.clicked.connect(lambda _c=False, i=i: self._event_clicked(i))
             return w
+        if i in self._expr_mode:  # Insert ▸ Function: the value as an expression (ISVS live/44)
+            w = QLineEdit(arg)
+            w.setProperty("reference", bool(referenced_locations(arg)))
+            w.editingFinished.connect(lambda i=i, w=w: self._set_arg(i, w.text().strip()))
+            return w
         if kind == "bool" and arg.strip() in ("0", "1"):
             w = QCheckBox()
             w.setChecked(arg.strip() == "1")
             w.toggled.connect(lambda on, i=i: self._set_arg(i, "1" if on else "0"))
             return w
         options = p.get("options") or []
-        if kind == "enum" and arg.strip().lstrip("-").isdigit() and int(arg) in {o["value"] for o in options}:
+        if kind == "enum" and arg.strip().lstrip("-").isdigit() and options:
             w = _Combo()
             for o in options:
                 w.addItem(o["label"], o["value"])
+            if w.findData(int(arg)) < 0:  # a value whose label is not known: listed by its number
+                w.addItem(str(int(arg)), int(arg))
             w.setCurrentIndex(w.findData(int(arg)))
             w.currentIndexChanged.connect(lambda _ix, i=i, w=w: self._set_arg(i, str(w.currentData())))
             return w
         if (kind == "number" or row.in_group) and _is_number(arg):
             lo = p.get("min", -1e6)
             hi = p.get("max", 1e6)
-            integral = (not row.in_group and "." not in arg and float(lo).is_integer() and float(hi).is_integer()
-                        and is_integer_parameter(p, self._descriptions.get(row.path, "")))
+            if "integer" in p:  # read in ISVS
+                integral = bool(p["integer"]) and float(arg).is_integer()
+            else:
+                integral = (not row.in_group and "." not in arg and float(lo).is_integer() and float(hi).is_integer()
+                            and is_integer_parameter(p, self._descriptions.get(row.path, "")))
             if integral:
                 w = _IntSpin()
                 w.setRange(int(lo), int(hi))
@@ -709,8 +746,7 @@ class PropertySheet(QDialog):
         if targets and self._values_ok:
             for loc in targets:
                 self.valueRequested.emit(loc, "1")
-        else:
-            self.desc_text.setText(self._event_tooltip(i))
+        # with no event cell ISVS does nothing visible either (survey §1.7); the tooltip explains
 
     # ------------------------------------------------------------------ state
     def refresh(self) -> None:
@@ -783,7 +819,7 @@ class PropertySheet(QDialog):
         self._values_ok, self._expr_ok = values_ok, expression_ok
         self._apply_permissions()
         if changed:
-            self._shown_region = None
+            self._shown_region = _UNSET
             self._emit_region()
 
     def _apply_permissions(self) -> None:
@@ -819,15 +855,32 @@ class PropertySheet(QDialog):
             return float(data)
         return None
 
+    def _rule_holds(self, rule: dict) -> Optional[bool]:
+        """``{"param", "values"|"not"}``, ``{"all": [...]}``, ``{"any": [...]}``; None when a value
+        cannot be evaluated (then the parameter stays enabled)."""
+        if "all" in rule or "any" in rule:
+            results = [self._rule_holds(r) for r in rule.get("all") or rule.get("any")]
+            if None in results:
+                return None
+            return all(results) if "all" in rule else any(results)
+        ctrl = self._leaf_by_label(rule.get("param", ""))
+        if ctrl is None or ctrl.index is None:
+            return None
+        v = self._arg_value(ctrl.index)
+        if v is None:
+            return None
+        if "not" in rule:
+            return int(v) not in rule["not"]
+        return int(v) in rule.get("values", [])
+
     def _apply_enable_rules(self) -> None:
         rules = (self.info.enable if self.info else None) or {}
         disabled: set[int] = set()
         for target, rule in rules.items():
-            leaf, ctrl = self._leaf_by_label(target), self._leaf_by_label(rule.get("param", ""))
-            if leaf is None or ctrl is None or leaf.index is None or ctrl.index is None:
+            leaf = self._leaf_by_label(target)
+            if leaf is None or leaf.index is None:
                 continue
-            v = self._arg_value(ctrl.index)
-            if v is not None and int(v) not in rule.get("values", []):
+            if self._rule_holds(rule) is False:
                 disabled.add(leaf.index)
         if disabled == self._disabled:
             return
@@ -898,6 +951,24 @@ class PropertySheet(QDialog):
             self._known.add(expr)
             self.expressionChanged.emit(self.location, expr)
 
+    def _insert_function(self) -> None:
+        """Insert ▸ Function (ISVS live/44): a value shown as a spin box, check box or list is
+        switched to a text box holding its value (an expression); in a text box a function
+        is picked and put at the cursor."""
+        row = self._current
+        if row is not None and row.index is not None and self._expr_ok:
+            i = row.index
+            if i not in self._expr_mode and not isinstance(self._editors.get(i), QLineEdit):
+                self._expr_mode.add(i)
+                self._populate_keep(i)
+                w = self._editors.get(i)
+                if isinstance(w, QLineEdit):
+                    w.setFocus()
+                    w.selectAll()
+            else:
+                self.functionRequested.emit()
+        self._update_actions()
+
     def insert_text(self, text: str) -> bool:
         """Insert ▸ Function: puts ``text`` at the cursor of the parameter being typed in."""
         row = self._current
@@ -961,17 +1032,17 @@ class PropertySheet(QDialog):
     def _update_actions(self) -> None:
         if not hasattr(self, "act_graphic"):
             return
-        spec = self._region_for(self._current)
-        literal = spec is not None and self._region_literal(spec)
+        spec = self._shown_spec()
+        literal = spec is not None
         loc = self._current_graphic_location()
         self.act_graphic.setEnabled((literal and self._expr_ok) or (loc is not None and self._values_ok))
         cell_region = loc is not None and (cells.editable_graphic(self.model.results.get(loc)) or {}).get(
             "$type") == "Region"
         self.act_maximize.setEnabled(self.image_size() is not None and (
             (literal and spec.type == "Region" and self._expr_ok) or (cell_region and self._values_ok)))
-        fw = QApplication.focusWidget()
-        self.act_function.setEnabled(self._expr_ok and isinstance(fw, QLineEdit)
-                                     and fw in self._editors.values())
+        current = self._current.index if self._current is not None else None
+        self.act_function.setEnabled(self._expr_ok and current is not None)
+        self.act_function.setChecked(current in self._expr_mode)
 
     def _current_graphic_location(self) -> Optional[str]:
         row = self._current
@@ -984,16 +1055,26 @@ class PropertySheet(QDialog):
         return None
 
     def _edit_current_graphic(self) -> None:
-        """F9 / double-click: a region given by numbers is already editable on the image (shown
-        again); a referenced Edit graphic cell goes to Interactive Graphics Mode."""
-        spec = self._region_for(self._current)
-        if spec is not None and self._region_literal(spec):
-            self._shown_region = None
-            self._emit_region()
-            return
+        """Edit ▸ Graphic (F9): a referenced Edit graphic cell goes to its Interactive Graphics
+        Mode; the region drawn for the sheet (given by numbers) is edited on the image while the
+        sheet steps aside (``regionEditRequested``; the caller hands the result to
+        :meth:`end_region_edit`)."""
         loc = self._current_graphic_location()
         if loc and self._values_ok:
             self.graphicEditRequested.emit(loc)
+            return
+        spec = self._shown_spec()
+        if spec is not None and self._expr_ok:
+            self._igm_spec = spec
+            self.regionEditRequested.emit(self._payload_for(spec))
+
+    def end_region_edit(self, graphic: Optional[dict]) -> None:
+        """Interactive Graphics Mode of the sheet's region ended: Return gives the edited
+        ``graphic`` (its numbers go into the parameters), Escape None."""
+        if graphic is not None:
+            self.graphic_edited(graphic)
+        self._igm_spec = None
+        self._shown_region = _UNSET
 
     def _restore_default(self) -> None:
         row = self._current
@@ -1056,11 +1137,26 @@ class PropertySheet(QDialog):
             g.setdefault("curve", 0.0)
         return g
 
-    def _region_payload(self) -> Optional[dict]:
-        """What regionShown sends for the selected row (None: no region given by numbers)."""
+    def _shown_spec(self) -> Optional[RegionSpec]:
+        """The region drawn while the sheet is open: the selected region parameter, else the
+        first one given by numbers (ISVS draws it whatever row is selected, live/25)."""
         spec = self._region_for(self._current)
-        if spec is None or not self._region_literal(spec) or not self.isVisible():
+        if spec is not None:
+            return spec if self._region_literal(spec) else None
+        for r in self.rows:
+            spec = region_spec(r)
+            if spec is not None and self._region_literal(spec):
+                return spec
+        return None
+
+    def _region_payload(self) -> Optional[dict]:
+        """What regionShown sends (None: no region given by numbers, or the sheet is hidden)."""
+        spec = self._shown_spec()
+        if spec is None or not self.isVisible():
             return None
+        return self._payload_for(spec)
+
+    def _payload_for(self, spec: RegionSpec) -> dict:
         transform, note = self.fixture()
         editable = self._expr_ok
         flags = {"move": editable, "resize": editable, "rotate": editable and "angle" in spec.keys,
@@ -1085,8 +1181,8 @@ class PropertySheet(QDialog):
         self.regionShown.emit(payload)
 
     def graphic_edited(self, g: dict) -> None:
-        """The region was dragged on the image: the numbers go into the parameters."""
-        spec = self._region_for(self._current)
+        """The region was edited on the image: the numbers go into the parameters."""
+        spec = self._igm_spec or self._shown_spec()
         if spec is None or not self._expr_ok or g.get("$type") != spec.type:
             return
         changed = False
@@ -1114,20 +1210,23 @@ class PropertySheet(QDialog):
         size = self.image_size()
         if size is None:
             return
-        spec = self._region_for(self._current)
-        if spec is not None and spec.type == "Region" and self._region_literal(spec) and self._expr_ok:
+        loc = self._current_graphic_location()
+        if loc and self._values_ok:
+            self.maximizeRequested.emit(loc)
+            return
+        spec = self._shown_spec()
+        if spec is not None and spec.type == "Region" and self._expr_ok:
             transform, _note = self.fixture()
             g = maximized_region(size[0], size[1], transform)
             for k, i in spec.keys.items():
                 if k in g:
                     self.args[i] = _fmt(g[k], 3)
-            index = self._current.index if self._current.index is not None else spec.group.children[0].index
-            self._populate_keep(index, expand=self._current.index is not None)
+            cur = self._current
+            if cur is not None and cur.index is not None:  # keep the selected row
+                self._populate_keep(cur.index, expand=True)
+            else:
+                self._populate_keep(spec.group.children[0].index, expand=False)
             self._write_timer.start()
-            return
-        loc = self._current_graphic_location()
-        if loc and self._values_ok:
-            self.maximizeRequested.emit(loc)
 
     # ------------------------------------------------------------------ cell references
     @property
@@ -1166,7 +1265,7 @@ class PropertySheet(QDialog):
         return True
 
     def _populate_keep(self, index: int, expand: bool = True) -> None:
-        self._shown_region = None
+        self._shown_region = _UNSET
         self._populate()
         it = self._item_for(index)
         if it is not None:
@@ -1180,7 +1279,7 @@ class PropertySheet(QDialog):
     # ------------------------------------------------------------------ OK / Cancel
     def showEvent(self, e) -> None:
         super().showEvent(e)
-        self._shown_region = None
+        self._shown_region = _UNSET
         self._emit_region()
 
     def hideEvent(self, e) -> None:

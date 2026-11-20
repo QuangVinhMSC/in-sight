@@ -63,11 +63,13 @@ def rc_of(loc: str) -> RC:
 
 
 # ---------------------------------------------------------------------------- references
-def rewrite_references(expr: Optional[str], mapping: Mapping) -> Optional[str]:
+def rewrite_references(expr: Optional[str], mapping: Mapping, keep_removed: bool = False) -> Optional[str]:
     """Points every cell reference in ``expr`` at the new position of the cell it refers to.
 
     Absolute/relative markers are kept (Insert/Delete move ``$A$1`` too, like a spreadsheet).
-    References to removed cells become ``#REF``. Text constants and string literals are kept.
+    References to removed cells become ``#REF`` — or stay as they are with ``keep_removed``
+    (ISVS's Delete: ``D1*2`` still reads ``D1*2`` after column D is deleted and then refers to the
+    cell that moved into D1; survey 2026-11-20). Text constants and string literals are kept.
     """
     if not expr or expr.startswith("'"):
         return expr
@@ -79,7 +81,7 @@ def rewrite_references(expr: Optional[str], mapping: Mapping) -> Optional[str]:
             return m.group(0)
         new = mapping(r, c)
         if new is None:
-            return REF_ERROR
+            return m.group(0) if keep_removed else REF_ERROR
         return f"{abs_col}{cells.col_name(new[1])}{abs_row}{new[0]}"
 
     out = []
@@ -183,13 +185,15 @@ def move_mapping(source: Block, d_row: int, d_col: int) -> Mapping:
     return mapping
 
 
-def plan_move(states: dict[str, CellState], mapping: Mapping, rewrite_all: bool = True) -> dict[str, CellState]:
+def plan_move(states: dict[str, CellState], mapping: Mapping, rewrite_all: bool = True,
+              keep_removed: bool = False) -> dict[str, CellState]:
     """Target states for moving cells according to ``mapping``.
 
     ``states`` holds the current state of every non-empty cell (names and conditions known).
     Returns only the cells that change. Moved cells take their name, condition and control
-    value along; references everywhere are rewritten. Cells mapped to None disappear (check
-    :func:`would_lose` first for an Insert).
+    value along; references everywhere are rewritten (``keep_removed``: see
+    :func:`rewrite_references`). Cells mapped to None disappear (check :func:`would_lose` first
+    for an Insert).
     """
     new: dict[str, CellState] = {}
     for loc, st in states.items():
@@ -200,8 +204,9 @@ def plan_move(states: dict[str, CellState], mapping: Mapping, rewrite_all: bool 
         if dest is None:
             continue
         moved = dest != (r, c)
-        expr = rewrite_references(st.expr, mapping) if rewrite_all or moved else st.expr
-        cond = rewrite_references(st.condition, mapping) if st.condition not in (None, "", "0") else st.condition
+        expr = rewrite_references(st.expr, mapping, keep_removed) if rewrite_all or moved else st.expr
+        cond = (rewrite_references(st.condition, mapping, keep_removed) if st.condition not in (None, "", "0")
+                else st.condition)
         new[loc_of(dest)] = CellState(expr=expr, name=st.name or "", condition=cond,
                                       value=st.value if moved else None)
     targets: dict[str, CellState] = {}

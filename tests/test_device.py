@@ -3,7 +3,7 @@
 import pytest
 
 from insight_studio.cogsocket import CogSocketError
-from insight_studio.device import InSightDevice
+from insight_studio.device import DeviceError, InSightDevice
 from insight_studio.devtools.fake_insight import FAKE_JOB_MAGIC, FakeInSight
 from insight_studio.qtasync import spawn, wait
 
@@ -93,6 +93,15 @@ def test_job_download_upload_roundtrip(device, fake):
     run(device.upload_job("test.jobx", data))
     assert fake.expressions["A5"] == "'hello"
     assert fake.job_name == "test.jobx"
+
+
+def test_upload_job_while_editor_attached(device, fake):
+    data = run(device.download_job("test.jobx"))
+    fake.editor_attached = True
+    device.editor_attached = True
+    with pytest.raises(DeviceError, match="editor .* is attached"):
+        run(device.upload_job("test.jobx", data))
+    fake.editor_attached = False
 
 
 def test_save_and_load_on_device(device, fake):

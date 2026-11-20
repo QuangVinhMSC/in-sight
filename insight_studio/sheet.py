@@ -531,8 +531,9 @@ class SheetView(QTableView):
         return r0, c0, out
 
     def copy_selection(self, conditions: Optional[dict[str, str]] = None, cut: bool = False) -> bool:
-        """Copies the selected rectangle. ``conditions``: cell states by location (copied like
-        references). ``cut`` marks the cells: they move when pasted (references follow them)."""
+        """Copies the selected rectangle with the cell names. ``conditions``: cell states by
+        location (copied like references). ``cut`` marks the cells: they move when pasted
+        (references follow them)."""
         sel = self._selection_block()
         if not sel:
             return False
@@ -547,9 +548,16 @@ class SheetView(QTableView):
             cond = (conditions or {}).get(cells.address(r0 + dr, c0 + dc))
             if cond:
                 conds[key] = cond
+        # ISVS copies cell names too; the vision system gives the copy a free name (Result_1)
+        names = {}
+        for key in block:
+            dr, dc = map(int, key.split(","))
+            name = getattr(self.model(), "names", {}).get(cells.address(r0 + dr, c0 + dc))
+            if name:
+                names[key] = name
         rows_n = 1 + max(int(k.split(",")[0]) for k in block)
         cols_n = 1 + max(int(k.split(",")[1]) for k in block)
-        doc = {"row": r0, "col": c0, "cells": block, "conditions": conds, "cut": cut,
+        doc = {"row": r0, "col": c0, "cells": block, "conditions": conds, "names": names, "cut": cut,
                "block": [r0, c0, r0 + rows_n - 1, c0 + cols_n - 1]}
         mime = QMimeData()
         mime.setData(self.MIME, json.dumps(doc).encode())
@@ -598,7 +606,8 @@ class SheetView(QTableView):
         out: dict
         if doc is not None:
             out = {"target": [target.row(), target.column()], "cells": doc.get("cells") or {},
-                   "conditions": doc.get("conditions") or {}, "source": [doc["row"], doc["col"]],
+                   "conditions": doc.get("conditions") or {}, "names": doc.get("names") or {},
+                   "source": [doc["row"], doc["col"]],
                    "cut": bool(doc.get("cut")), "block": doc.get("block")}
         elif mime is not None and mime.hasText():
             block = {}
